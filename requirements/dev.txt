@@ -1,0 +1,4 @@
+-r base.txt
+-r optional-model.txt
+-r optional-qt.txt
+pytest>=8.0.0

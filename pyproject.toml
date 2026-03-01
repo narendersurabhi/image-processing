@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portrait-enhancer"
+version = "0.1.0"
+description = "Desktop portrait editor for RAW workflows, selective masks, presets, and batch export."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+  { name = "Narender Surabhi" }
+]
+dependencies = [
+  "numpy>=1.24.0",
+  "opencv-python>=4.8.0",
+  "Pillow>=10.0.0",
+  "rawpy>=0.18.1",
+]
+
+[project.optional-dependencies]
+model = [
+  "mediapipe>=0.10.14",
+  "onnxruntime>=1.18.0",
+]
+qt = [
+  "PySide6>=6.7.0",
+]
+dev = [
+  "pytest>=8.0.0",
+]
+all = [
+  "mediapipe>=0.10.14",
+  "onnxruntime>=1.18.0",
+  "PySide6>=6.7.0",
+  "pytest>=8.0.0",
+]
+
+[project.gui-scripts]
+portrait-enhancer = "portrait_enhancer:run_app"
+portrait-enhancer-qt = "portrait_enhancer:run_qt_app"
+
+[project.scripts]
+portrait-enhancer-batch = "portrait_enhancer.batch_runner:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["portrait_enhancer*"]

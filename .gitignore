@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+.ort_coreml_cache/
+__pycache__/
+*.pyc
+
+build/
+dist/
+*.egg-info/
+
+models/*.onnx
+models/*.tflite
+models/*.task
+!models/README.md
+
+presets/.preset_browser_state.json
+presets/*.thumb.jpg
