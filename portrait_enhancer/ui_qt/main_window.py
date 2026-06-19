@@ -1549,6 +1549,76 @@ class PreviewRenderTask(QRunnable):
         self.signals.finished.emit(self.job_id, result, float(elapsed_ms))
 
 
+class FilmstripThumbnail(QFrame):
+    """Clickable thumbnail widget for the image filmstrip."""
+
+    clicked = Signal(str)  # emits the image path
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self.path = str(path)
+        self._pixmap = None
+        self._is_active = False
+
+        self.setObjectName("FilmstripThumbnail")
+        self.setFrameShape(QFrame.Box)
+        self.setLineWidth(1)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedWidth(80)
+        self.setFixedHeight(98)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        self.thumb_label = QLabel(self)
+        self.thumb_label.setAlignment(Qt.AlignCenter)
+        self.thumb_label.setMinimumSize(72, 60)
+        self.thumb_label.setMaximumSize(72, 60)
+        layout.addWidget(self.thumb_label)
+
+        self.name_label = QLabel(self)
+        self.name_label.setAlignment(Qt.AlignCenter)
+        self.name_label.setObjectName("MutedLabel")
+        self.name_label.setWordWrap(False)
+        self.name_label.setStyleSheet("font-size: 9px;")
+        fname = Path(path).stem
+        self.name_label.setText(fname[:12] + ("..." if len(fname) > 12 else ""))
+        self.name_label.setToolTip(Path(path).name)
+        layout.addWidget(self.name_label)
+        layout.addStretch(1)
+
+        self.set_active(False)
+
+    def set_pixmap(self, pixmap: QPixmap | None):
+        if pixmap is None:
+            self.thumb_label.setText("No preview")
+            self._pixmap = None
+            return
+        # Scale to fit the label while keeping aspect ratio.
+        scaled = pixmap.scaled(72, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.thumb_label.setPixmap(scaled)
+        self._pixmap = scaled
+
+    def set_active(self, active: bool):
+        self._is_active = bool(active)
+        if active:
+            self.setStyleSheet(
+                "FilmstripThumbnail { border: 2px solid #d4a853; background: #1a1a1a; }"
+            )
+        else:
+            self.setStyleSheet(
+                "FilmstripThumbnail { border: 1px solid #3a3a3a; background: #141414; }"
+            )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.path)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+
 class PortraitEnhancerQtWindow(QMainWindow):
     SUPPORTED_IMAGE_EXTS = (".cr2", ".nef", ".arw", ".dng", ".raw", ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
     BATCH_OUTPUT_FORMATS = {
@@ -2139,6 +2209,38 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.image_label.set_wb_pick_state(False, self._on_wb_picked)
         canvas_layout.addWidget(self.image_label, 1)
         center_layout.addWidget(canvas_frame, 1)
+
+        # Filmstrip for quick image navigation.
+        filmstrip_frame = QFrame(self)
+        self._filmstrip_frame = filmstrip_frame
+        filmstrip_frame.setObjectName("FilmstripStrip")
+        filmstrip_frame.setMaximumHeight(110)
+        filmstrip_frame.setMinimumHeight(0)
+        filmstrip_layout = QVBoxLayout(filmstrip_frame)
+        filmstrip_layout.setContentsMargins(8, 6, 8, 6)
+        filmstrip_layout.setSpacing(0)
+
+        filmstrip_label = QLabel("Images in folder", self)
+        filmstrip_label.setObjectName("MutedLabel")
+        filmstrip_layout.addWidget(filmstrip_label)
+
+        filmstrip_scroll = QScrollArea(self)
+        filmstrip_scroll.setWidgetResizable(True)
+        filmstrip_scroll.setFrameShape(QFrame.NoFrame)
+        filmstrip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        filmstrip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self._filmstrip_host = QWidget(self)
+        self._filmstrip_layout = QHBoxLayout(self._filmstrip_host)
+        self._filmstrip_layout.setContentsMargins(0, 0, 0, 0)
+        self._filmstrip_layout.setSpacing(6)
+        filmstrip_scroll.setWidget(self._filmstrip_host)
+        filmstrip_layout.addWidget(filmstrip_scroll, 1)
+
+        self._filmstrip_items = {}  # path -> thumbnail widget
+        self._filmstrip_images = []  # sorted list of image paths
+        self._current_filmstrip_path = None
+        center_layout.addWidget(filmstrip_frame, 0)
 
         status_panel = QFrame(self)
         self._status_panel = status_panel
@@ -4887,6 +4989,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.file_path = path
         self.statusBar().showMessage(f"Loading {os.path.basename(path)} ...")
         self.image_label.reset_view()
+        self._populate_filmstrip(str(Path(path).parent))
         full = self._read_image_file(path)
         preview, scale = self._build_preview_proxy(full)
         interactive_preview, interactive_ratio = self._build_interactive_preview_proxy(preview)
@@ -4914,6 +5017,101 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self._run_segmentation()
             self._clear_document_history()
             self._push_document_history()
+
+    def _populate_filmstrip(self, folder: str):
+        """Scan folder for images and populate the filmstrip."""
+        folder_path = Path(folder)
+        if not folder_path.is_dir():
+            return
+
+        # Clear old filmstrip.
+        for widget in self._filmstrip_items.values():
+            widget.deleteLater()
+        self._filmstrip_items.clear()
+        self._filmstrip_images.clear()
+
+        # Scan for supported image files.
+        supported = self.SUPPORTED_IMAGE_EXTS
+        image_files = sorted(
+            p for p in folder_path.iterdir()
+            if p.is_file() and p.suffix.lower() in supported
+        )
+        self._filmstrip_images = [str(p) for p in image_files]
+
+        # Create thumbnails.
+        for img_path in self._filmstrip_images:
+            thumb = FilmstripThumbnail(img_path, self)
+            thumb.clicked.connect(self._on_filmstrip_image_clicked)
+            self._filmstrip_layout.addWidget(thumb)
+            self._filmstrip_items[img_path] = thumb
+
+            # Load thumbnail asynchronously to avoid blocking.
+            self._load_thumbnail_async(img_path, thumb)
+
+        self._filmstrip_layout.addStretch(1)
+        self._update_filmstrip_active()
+
+    def _load_thumbnail_async(self, img_path: str, thumb_widget: FilmstripThumbnail):
+        """Load a thumbnail image asynchronously (worker thread)."""
+        def load_thumb():
+            try:
+                ext = Path(img_path).suffix.lower()
+                if ext in {".cr2", ".nef", ".arw", ".dng", ".raw"}:
+                    if not HAS_RAWPY:
+                        return None
+                    with rawpy.imread(img_path) as raw:
+                        rgb16 = raw.postprocess(use_camera_wb=True, output_bps=16)
+                    img_array = rgb16.astype(np.float32) / 65535.0
+                else:
+                    pil = Image.open(img_path).convert("RGB")
+                    img_array = np.asarray(pil, dtype=np.float32) / 255.0
+
+                # Scale to fit thumbnail (max 200x200 for speed).
+                h, w = img_array.shape[:2]
+                max_dim = 200
+                if w > max_dim or h > max_dim:
+                    scale = max_dim / max(w, h)
+                    new_w, new_h = int(w * scale), int(h * scale)
+                    img_array = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                # Convert to QPixmap.
+                img_uint8 = (np.clip(img_array, 0, 1) * 255).astype(np.uint8)
+                h, w = img_uint8.shape[:2]
+                if len(img_uint8.shape) == 3 and img_uint8.shape[2] == 3:
+                    qimg = QImage(img_uint8.data, w, h, 3 * w, QImage.Format_RGB888)
+                else:
+                    # Grayscale, convert to RGB.
+                    img_uint8_rgb = np.stack([img_uint8] * 3, axis=-1)
+                    qimg = QImage(img_uint8_rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+
+                return QPixmap.fromImage(qimg)
+            except Exception:
+                return None
+
+        def set_thumb(pixmap):
+            if pixmap is not None and img_path in self._filmstrip_items:
+                self._filmstrip_items[img_path].set_pixmap(pixmap)
+
+        # Run in thread pool to avoid blocking UI.
+        worker = lambda: set_thumb(load_thumb())
+        import threading
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def _update_filmstrip_active(self):
+        """Highlight the current image in the filmstrip."""
+        for path, thumb in self._filmstrip_items.items():
+            thumb.set_active(path == self.file_path)
+        self._current_filmstrip_path = self.file_path
+
+    def _on_filmstrip_image_clicked(self, path: str):
+        """Load the clicked image from the filmstrip."""
+        if path == self.file_path:
+            return
+        if not Path(path).is_file():
+            self.statusBar().showMessage(f"File not found: {path}")
+            return
+        self.open_image(path)
 
     def _read_image_file(self, path: str):
         ext = Path(path).suffix.lower()
