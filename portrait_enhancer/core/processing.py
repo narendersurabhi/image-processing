@@ -6,6 +6,9 @@ from PIL import Image, ImageEnhance
 
 from portrait_enhancer.config import MASK_ORDER
 from .refine import get_face_refiner
+from .white_balance import NEUTRAL_K, apply_white_balance_gains, kelvin_tint_to_gains
+from .tone_curve import apply_curve
+from .color_mixer import apply_color_mixer
 from .utils import (
     adjust_color_balance_preserve_chroma,
     adjust_hsv_hue,
@@ -779,6 +782,14 @@ def process_global(
     working_space = _working_space(color_settings)
     acceleration = _acceleration_mode(runtime_settings)
     img = img.copy()
+
+    # White balance correction first: neutralize a color cast in linear light
+    # before any tonal/stylistic grade is applied. Temperature (Kelvin) + Tint are
+    # the canonical setting; default 6500K/0 is identity.
+    cs = color_settings or {}
+    wb_gains = kelvin_tint_to_gains(cs.get("wb_temp_k", NEUTRAL_K), cs.get("wb_tint", 0))
+    img = apply_white_balance_gains(img, wb_gains, working_space=working_space)
+
     ev = p.get("exposure", 0) / 100.0
     img = clamp01(img * (2**ev))
 
@@ -798,12 +809,22 @@ def process_global(
         p.get("whites", 0),
     )
 
+    # Interactive tone curve shapes tonality on top of the band sliders.
+    tone_points = cs.get("tone_curve")
+    if tone_points:
+        img = apply_curve(img, tone_points)
+
     clarity = p.get("clarity", 0)
     if clarity != 0:
         img = _apply_micro_contrast(img, clarity, acceleration=acceleration, detail_sigma=1.8, base_sigma=9.0, edge_strength=2.4)
 
     img = adjust_hsv_sat(img, p.get("vibrance", 0) * 0.5 + p.get("saturation", 0) * 0.5, working_space=working_space)
     img = adjust_hsv_sat(img, p.get("vibrance", 0) * 0.5, working_space=working_space)
+
+    # HSL color mixer: per-hue-band hue/saturation/luminance grading.
+    color_mixer = cs.get("color_mixer")
+    if color_mixer:
+        img = apply_color_mixer(img, color_mixer, working_space=working_space)
 
     sharpness = p.get("sharpness", 0) / 100.0
     if sharpness > 0:

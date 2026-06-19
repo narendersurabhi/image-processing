@@ -12,6 +12,7 @@ A desktop RAW photo editor with real-time preview and selective portrait layers.
 - Selective adjustment layers: Face, Skin, Eyes, Lips, Hair
 - Layer stack controls: per-layer enable, opacity, blend mode, and ordering
 - Interactive mask tools: paint, erase, feather, and reset-to-auto
+- Non-destructive per-mask settings for strength, feather, and expand/contract
 - Multi-face target picker (select which detected face drives selective masks)
 - Per-face selective profiles (switching faces preserves that face's local adjustments and masks)
 - Mask history controls: undo/redo for manual mask edits
@@ -40,40 +41,48 @@ A desktop RAW photo editor with real-time preview and selective portrait layers.
 ## Setup
 
 ```bash
-# Install runtime dependencies only
-pip install -r requirements.txt
+# Install uv if needed
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install Qt frontend dependencies
-pip install -r requirements/optional-qt.txt
+# Create .venv and install the app with runtime dependencies
+uv sync
 
-# Or install as a package with launcher extras
-pip install .
-pip install .[qt]
+# Include the Qt frontend
+uv sync --extra qt
+
+# Include optional model backends too
+uv sync --extra qt --extra model
+
+# Or install everything, including test dependencies
+uv sync --all-extras
 
 # Run app (any option)
-python portrait_enhancer_v2.py
-python portrait_enhancer_qt.py
-python -m portrait_enhancer
-portrait-enhancer
-portrait-enhancer-qt
+uv run portrait-enhancer
+uv run --extra qt portrait-enhancer-qt
+uv run python -m portrait_enhancer
+uv run python portrait_enhancer_v2.py
+uv run --extra qt python portrait_enhancer_qt.py
+
+# Run tests
+uv run --extra dev pytest
 ```
 
 ## Dependency Sets
-1. `requirements.txt`: base runtime dependencies.
-2. `requirements/base.txt`: canonical runtime dependency list.
-3. `requirements/optional-model.txt`: ONNX + MediaPipe model backend.
-4. `requirements/optional-qt.txt`: PySide6 frontend dependency.
-5. `requirements/dev.txt`: local development and test extras.
-6. `requirements_v2.txt` and `requirements_phase3_optional.txt` remain as compatibility wrappers for older instructions.
+1. `pyproject.toml`: canonical dependency metadata for `uv sync` and package installs.
+2. Default dependencies: base runtime dependencies.
+3. `qt` extra: PySide6 frontend dependency.
+4. `model` extra: ONNX + MediaPipe model backend.
+5. `dev` extra: local development and test dependencies.
+6. `requirements.txt`, `requirements/base.txt`, `requirements/optional-model.txt`, `requirements/optional-qt.txt`, `requirements/dev.txt`, `requirements_v2.txt`, and `requirements_phase3_optional.txt` remain as compatibility wrappers for older pip-based instructions.
 
 ## Packaging
 1. The project now ships package metadata in `pyproject.toml`.
 2. GUI entrypoint: `portrait-enhancer`.
 3. Optional extras:
-   - `pip install .[model]`
-   - `pip install .[qt]`
-   - `pip install .[dev]`
-   - `pip install .[all]`
+   - `uv sync --extra model`
+   - `uv sync --extra qt`
+   - `uv sync --extra dev`
+   - `uv sync --all-extras`
 
 ## Qt Frontend
 1. The PySide6 frontend is available in parallel with the existing Tk app.
@@ -87,8 +96,14 @@ portrait-enhancer-qt
     - face selection
     - live layer sliders for all layers
     - compare modes: `off`, `before`, `split`, `side_by_side`
+    - live RGB + luminance histogram with shadow/highlight clipping markers
+    - interactive tone curve (monotone-cubic, drag/add/remove points) with a histogram backdrop
+    - HSL color mixer: per-hue-band hue/saturation/luminance (8 bands)
+    - white balance: Kelvin Temperature/Tint sliders, illuminant presets (Tungsten/Daylight/Cloudy/Shade/…), neutral-pick eyedropper with magnified loupe, and gray-world/white-patch auto (per-channel gains in linear light)
+    - frame geometry: crop (aspect presets + draggable crop box), straighten, flip — non-destructive, saved in the project
     - active-layer mask overlay
     - basic mask editing: paint, erase, brush size, reset-to-auto
+    - per-mask strength, feather, and expand/contract controls for subject, background, skin, eyes, lips, and hair masks
     - project save/load (`.peproj`)
     - document undo/redo for slider, compare, face-target, and layer-reset changes
     - startup readiness check and manual `System Check` dialog for model/runtime status
@@ -170,9 +185,7 @@ portrait-enhancer-qt
 ### Optional model backend (Phase 3)
 ```bash
 # Optional runtime deps for model-based masks
-pip install -r requirements/optional-model.txt
-# or
-pip install .[model]
+uv sync --extra model
 ```
 
 Provide a face parsing ONNX model using one of:
@@ -232,7 +245,10 @@ Backend status is shown in the app status bar during analysis.
 3. Each face keeps its own selective sliders, layer mix settings, and edited masks.
 4. Status bar shows `faces=<n>, target=<index>` after analysis.
 
-## Next Recommended Upgrades
+## Roadmap
+See [ROADMAP.md](ROADMAP.md) for the full prioritized roadmap, including the larger
+editing gaps (crop/straighten, interactive tone curve, HSL mixer, manual
+retouching, and local-adjustment masks). Near-term refinements:
 1. Add stronger LUT/profile management: validation previews, intensity mix, and support for more LUT/profile formats.
 2. Add brush hardness/flow and pressure-sensitive tablet support for mask editing.
 3. Add optional GPU acceleration for preview rendering and mask inference.
