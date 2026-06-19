@@ -56,6 +56,13 @@ from PySide6.QtWidgets import (
 )
 
 from portrait_enhancer.config import ALL_LAYERS, LAYER_COLORS, LAYER_NAMES, MASK_ORDER
+from portrait_enhancer.core import framing as framing_ops
+from portrait_enhancer.core.framing import apply_framing, default_framing, normalize_framing
+from portrait_enhancer.core.histogram import compute_histogram
+from portrait_enhancer.core import white_balance as wb_ops
+from portrait_enhancer.core import tone_curve as tc_ops
+from portrait_enhancer.core import color_mixer as cm_ops
+from portrait_enhancer.core.masks import apply_mask_adjustments, default_mask_adjustments, normalize_mask_adjustments
 from portrait_enhancer.core.processing import process_all_layers, _scale_expression_guides, expression_warp_mode
 from portrait_enhancer.core.refine import get_face_refiner
 from portrait_enhancer.core.segmentation import FaceSegmenter
@@ -539,9 +546,21 @@ class ImagePreviewLabel(QLabel):
         self._brush_radius = 24
         self._brush_hardness = 100
         self._source_image_size = None
+        self._crop_overlay = None
+        self._crop_change_callback = None
+        self._crop_commit_callback = None
+        self._crop_start_callback = None
+        self._crop_drag_handle = None
+        self._crop_drag_last = None
+        self._wb_pick_enabled = False
+        self._wb_pick_callback = None
+        self._pixmap_image = None
+        self._wb_hover_src = None
+        self._wb_hover_widget = None
 
     def set_preview_pixmap(self, pixmap: QPixmap | None):
         self._pixmap = pixmap
+        self._pixmap_image = pixmap.toImage() if pixmap is not None else None
         self._apply_scaled_pixmap()
 
     def set_compare_state(self, mode: str, split_callback=None):
@@ -562,17 +581,144 @@ class ImagePreviewLabel(QLabel):
         self._source_image_size = source_image_size
         self.update()
 
+    def set_crop_overlay(self, crop_rect):
+        """Show an interactive crop box (normalized rect), or None to hide it."""
+        self._crop_overlay = list(crop_rect) if crop_rect is not None else None
+        if crop_rect is None:
+            self._crop_drag_handle = None
+            self._crop_drag_last = None
+        self.update()
+
+    def set_crop_callbacks(self, change_callback=None, commit_callback=None, start_callback=None):
+        self._crop_change_callback = change_callback
+        self._crop_commit_callback = commit_callback
+        self._crop_start_callback = start_callback
+
+    def set_wb_pick_state(self, enabled: bool, callback=None):
+        self._wb_pick_enabled = bool(enabled)
+        self._wb_pick_callback = callback
+        if not self._wb_pick_enabled:
+            self._wb_hover_src = None
+            self._wb_hover_widget = None
+        self.setCursor(Qt.CrossCursor if self._wb_pick_enabled else Qt.ArrowCursor)
+        self.update()
+
+    def _pixmap_rect(self):
+        """(x0, y0, w, h) of the displayed pixmap inside the widget, or None."""
+        pix = self._scaled_pixmap if self._scaled_pixmap is not None else self.pixmap()
+        if pix is None or pix.width() <= 0 or pix.height() <= 0:
+            return None
+        rect = self.contentsRect()
+        x0 = rect.x() + (rect.width() - pix.width()) / 2.0
+        y0 = rect.y() + (rect.height() - pix.height()) / 2.0
+        return x0, y0, float(pix.width()), float(pix.height())
+
+    def _widget_to_norm(self, wx: float, wy: float):
+        geom = self._pixmap_rect()
+        if geom is None:
+            return None
+        x0, y0, pw, ph = geom
+        return (float(wx) - x0) / pw, (float(wy) - y0) / ph
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._apply_scaled_pixmap()
 
     def leaveEvent(self, event):
         self._hover_rel = None
+        self._wb_hover_src = None
+        self._wb_hover_widget = None
         self.update()
         super().leaveEvent(event)
 
+    def _paint_crop_overlay(self):
+        geom = self._pixmap_rect()
+        if geom is None or self._crop_overlay is None:
+            return
+        x0, y0, pw, ph = geom
+        cx, cy, cw, ch = self._crop_overlay
+        bx = x0 + cx * pw
+        by = y0 + cy * ph
+        bw = cw * pw
+        bh = ch * ph
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        # Dim the area outside the crop box.
+        dim = QColor(0, 0, 0, 130)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(dim)
+        painter.drawRect(int(x0), int(y0), int(pw), int(by - y0))
+        painter.drawRect(int(x0), int(by + bh), int(pw), int(y0 + ph - (by + bh)))
+        painter.drawRect(int(x0), int(by), int(bx - x0), int(bh))
+        painter.drawRect(int(bx + bw), int(by), int(x0 + pw - (bx + bw)), int(bh))
+
+        # Box outline and rule-of-thirds guides.
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.drawRect(int(bx), int(by), int(bw), int(bh))
+        painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
+        for i in (1, 2):
+            painter.drawLine(int(bx + bw * i / 3), int(by), int(bx + bw * i / 3), int(by + bh))
+            painter.drawLine(int(bx), int(by + bh * i / 3), int(bx + bw), int(by + bh * i / 3))
+
+        # Corner/edge handles.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(212, 168, 83))
+        hs = 7
+        for nx, ny in (
+            (cx, cy), (cx + cw / 2, cy), (cx + cw, cy),
+            (cx + cw, cy + ch / 2), (cx + cw, cy + ch),
+            (cx + cw / 2, cy + ch), (cx, cy + ch), (cx, cy + ch / 2),
+        ):
+            hx = x0 + nx * pw
+            hy = y0 + ny * ph
+            painter.drawRect(int(hx - hs / 2), int(hy - hs / 2), hs, hs)
+        painter.end()
+
+    def _paint_wb_loupe(self):
+        if self._pixmap_image is None or self._wb_hover_src is None or self._wb_hover_widget is None:
+            return
+        img = self._pixmap_image
+        sx, sy = self._wb_hover_src
+        cells, half, zoom = 9, 4, 12
+        size = cells * zoom
+        wx, wy = self._wb_hover_widget
+        rect = self.rect()
+        lx = wx + 18 if wx + 18 + size <= rect.right() else wx - 18 - size
+        ly = wy + 18 if wy + 18 + size <= rect.bottom() else wy - 18 - size
+        lx = max(rect.left(), min(lx, rect.right() - size))
+        ly = max(rect.top(), min(ly, rect.bottom() - size))
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        for j in range(cells):
+            for i in range(cells):
+                px, py = sx - half + i, sy - half + j
+                if 0 <= px < img.width() and 0 <= py < img.height():
+                    color = img.pixelColor(px, py)
+                else:
+                    color = QColor(20, 20, 20)
+                painter.fillRect(lx + i * zoom, ly + j * zoom, zoom, zoom, color)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.drawRect(lx + half * zoom, ly + half * zoom, zoom, zoom)
+        painter.setPen(QPen(QColor(0, 0, 0), 1))
+        painter.drawRect(lx, ly, size - 1, size - 1)
+        if 0 <= sx < img.width() and 0 <= sy < img.height():
+            c = img.pixelColor(sx, sy)
+            tb_y = ly + size + 2 if ly + size + 18 <= rect.bottom() else ly - 18
+            painter.fillRect(lx, tb_y, size, 16, QColor(0, 0, 0, 210))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(lx + 3, tb_y + 12, f"{c.red()},{c.green()},{c.blue()}")
+        painter.end()
+
     def paintEvent(self, event):
         super().paintEvent(event)
+        if self._crop_overlay is not None:
+            self._paint_crop_overlay()
+        if self._wb_pick_enabled:
+            self._paint_wb_loupe()
         if not self._edit_enabled or self._hover_rel is None or self._scaled_pixmap is None:
             return
         if not self._source_image_size or self._source_image_size[0] <= 0 or self._source_image_size[1] <= 0:
@@ -613,6 +759,24 @@ class ImagePreviewLabel(QLabel):
         painter.end()
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._wb_pick_enabled and self._wb_pick_callback is not None:
+            norm = self._widget_to_norm(event.position().x(), event.position().y())
+            if norm is not None and 0.0 <= norm[0] <= 1.0 and 0.0 <= norm[1] <= 1.0:
+                self._wb_pick_callback(norm[0], norm[1])
+                event.accept()
+                return
+        if event.button() == Qt.LeftButton and self._crop_overlay is not None:
+            norm = self._widget_to_norm(event.position().x(), event.position().y())
+            if norm is not None:
+                tol = self._crop_handle_tolerance()
+                handle = framing_ops.hit_test_handle(self._crop_overlay, norm[0], norm[1], tol)
+                if handle is not None:
+                    self._crop_drag_handle = handle
+                    self._crop_drag_last = norm
+                    if self._crop_start_callback is not None:
+                        self._crop_start_callback()
+                    event.accept()
+                    return
         if event.button() == Qt.LeftButton and self._edit_enabled and self._paint_callback is not None:
             self._update_hover_rel(event.position().x(), event.position().y())
             if self._paint_start_callback is not None:
@@ -628,7 +792,41 @@ class ImagePreviewLabel(QLabel):
             return
         super().mousePressEvent(event)
 
+    def _crop_handle_tolerance(self) -> float:
+        geom = self._pixmap_rect()
+        if geom is None:
+            return 0.03
+        _x0, _y0, pw, _ph = geom
+        return max(0.02, 10.0 / max(1.0, pw))
+
     def mouseMoveEvent(self, event):
+        if self._wb_pick_enabled:
+            norm = self._widget_to_norm(event.position().x(), event.position().y())
+            pix = self._pixmap
+            if norm is not None and pix is not None and 0.0 <= norm[0] <= 1.0 and 0.0 <= norm[1] <= 1.0:
+                self._wb_hover_src = (
+                    int(round(norm[0] * (pix.width() - 1))),
+                    int(round(norm[1] * (pix.height() - 1))),
+                )
+                self._wb_hover_widget = (event.position().x(), event.position().y())
+            else:
+                self._wb_hover_src = None
+                self._wb_hover_widget = None
+            self.update()
+            event.accept()
+            return
+        if self._crop_drag_handle is not None and self._crop_overlay is not None:
+            norm = self._widget_to_norm(event.position().x(), event.position().y())
+            if norm is not None and self._crop_drag_last is not None:
+                dx = norm[0] - self._crop_drag_last[0]
+                dy = norm[1] - self._crop_drag_last[1]
+                self._crop_overlay = framing_ops.resize_crop(self._crop_overlay, self._crop_drag_handle, dx, dy)
+                self._crop_drag_last = norm
+                if self._crop_change_callback is not None:
+                    self._crop_change_callback(list(self._crop_overlay))
+                self.update()
+            event.accept()
+            return
         self._update_hover_rel(event.position().x(), event.position().y())
         if self._dragging_paint and self._edit_enabled and self._paint_callback is not None:
             self._emit_paint_point(event.position().x(), event.position().y())
@@ -642,6 +840,11 @@ class ImagePreviewLabel(QLabel):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
+            if self._crop_drag_handle is not None:
+                self._crop_drag_handle = None
+                self._crop_drag_last = None
+                if self._crop_commit_callback is not None:
+                    self._crop_commit_callback()
             self._dragging_split = False
             self._dragging_paint = False
         super().mouseReleaseEvent(event)
@@ -694,6 +897,236 @@ class ImagePreviewLabel(QLabel):
         rel_y = (float(widget_y) - y0) / float(pix.height())
         if 0.0 <= rel_x <= 1.0 and 0.0 <= rel_y <= 1.0:
             self._paint_callback(rel_x, rel_y)
+
+
+class HistogramWidget(QWidget):
+    """Compact RGB + luminance histogram with clipping indicators."""
+
+    _CLIP_THRESHOLD = 0.005  # >0.5% of pixels clipped lights the warning marker
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._data = None
+        self.setMinimumHeight(84)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setToolTip("Histogram of the edited preview (R/G/B + luma)")
+
+    def set_histogram(self, data: dict | None):
+        self._data = data
+        self.update()
+
+    def clear(self):
+        self.set_histogram(None)
+
+    def paintEvent(self, event):  # noqa: N802 (Qt override)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        painter.fillRect(self.rect(), QColor("#0c0c0e"))
+
+        if not self._data:
+            painter.setPen(QColor("#5a5650"))
+            painter.drawText(rect, Qt.AlignCenter, "Histogram")
+            painter.end()
+            return
+
+        levels = int(self._data.get("levels", 256))
+        width = rect.width()
+        height = rect.height()
+
+        channels = (
+            ("luma", QColor(200, 200, 200, 150)),
+            ("red", QColor(212, 88, 88, 150)),
+            ("green", QColor(120, 200, 120, 150)),
+            ("blue", QColor(110, 150, 220, 160)),
+        )
+
+        # Shared scale (skip pure-black/white spikes so they don't flatten the curve).
+        peak = 1.0
+        for name, _ in channels:
+            counts = np.asarray(self._data.get(name), dtype=np.float64)
+            if counts.size >= levels and levels > 2:
+                interior = counts[1 : levels - 1]
+                if interior.size:
+                    peak = max(peak, float(interior.max()))
+        log_peak = np.log1p(peak)
+
+        for name, color in channels:
+            counts = np.asarray(self._data.get(name), dtype=np.float64)
+            if counts.size < levels:
+                continue
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            scaled = np.log1p(counts) / log_peak if log_peak > 0 else counts * 0.0
+            for x in range(width):
+                lo = int(x * levels / width)
+                hi = max(lo + 1, int((x + 1) * levels / width))
+                value = float(scaled[lo:hi].max()) if hi <= levels else 0.0
+                bar_h = int(min(1.0, value) * height)
+                if bar_h > 0:
+                    painter.drawRect(rect.left() + x, rect.bottom() - bar_h, 1, bar_h)
+
+        # Clipping markers: bottom-left for crushed shadows, bottom-right for blown highlights.
+        shadow = self._data.get("shadow_clip", {})
+        highlight = self._data.get("highlight_clip", {})
+        shadow_clipped = any(v > self._CLIP_THRESHOLD for v in shadow.values())
+        highlight_clipped = any(v > self._CLIP_THRESHOLD for v in highlight.values())
+        marker = 6
+        if shadow_clipped:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(91, 155, 213))
+            painter.drawRect(rect.left(), rect.top(), marker, marker)
+        if highlight_clipped:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(212, 168, 83))
+            painter.drawRect(rect.right() - marker + 1, rect.top(), marker, marker)
+        painter.end()
+
+
+class ToneCurveWidget(QWidget):
+    """Interactive tone curve: drag points, click to add, double-click to remove."""
+
+    _TOL = 0.045
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._points = tc_ops.default_curve()
+        self._hist = None
+        self._drag_index = None
+        self._change_cb = None
+        self._commit_cb = None
+        self._start_cb = None
+        self.setMinimumHeight(190)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setToolTip("Drag points to shape tones · click to add · double-click to remove")
+
+    def set_points(self, points):
+        self._points = [tuple(p) for p in tc_ops.normalize_curve(points)]
+        self.update()
+
+    def set_histogram(self, hist):
+        self._hist = hist
+        self.update()
+
+    def set_callbacks(self, change=None, commit=None, start=None):
+        self._change_cb = change
+        self._commit_cb = commit
+        self._start_cb = start
+
+    def _plot_rect(self):
+        return self.contentsRect().adjusted(6, 6, -6, -6)
+
+    def _to_widget(self, x, y):
+        r = self._plot_rect()
+        return r.left() + x * r.width(), r.bottom() - y * r.height()
+
+    def _to_norm(self, wx, wy):
+        r = self._plot_rect()
+        if r.width() <= 0 or r.height() <= 0:
+            return 0.0, 0.0
+        x = (float(wx) - r.left()) / r.width()
+        y = (r.bottom() - float(wy)) / r.height()
+        return min(1.0, max(0.0, x)), min(1.0, max(0.0, y))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#141318"))
+        r = self._plot_rect()
+
+        # Faint luminance histogram backdrop.
+        if self._hist is not None:
+            luma = np.asarray(self._hist.get("luma"), dtype=np.float64)
+            if luma.size:
+                interior = luma[1:-1] if luma.size > 2 else luma
+                peak = np.log1p(float(interior.max())) if interior.size else 1.0
+                if peak > 0:
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QColor(90, 90, 100, 90))
+                    levels = luma.size
+                    for x in range(r.width()):
+                        lo = int(x * levels / r.width())
+                        hi = max(lo + 1, int((x + 1) * levels / r.width()))
+                        val = float(np.log1p(luma[lo:hi].max())) / peak
+                        bar = int(min(1.0, val) * r.height())
+                        if bar > 0:
+                            painter.drawRect(r.left() + x, r.bottom() - bar, 1, bar)
+
+        # Grid (thirds) and identity diagonal.
+        painter.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        for i in (1, 2):
+            painter.drawLine(int(r.left() + r.width() * i / 3), r.top(), int(r.left() + r.width() * i / 3), r.bottom())
+            painter.drawLine(r.left(), int(r.top() + r.height() * i / 3), r.right(), int(r.top() + r.height() * i / 3))
+        painter.setPen(QPen(QColor(255, 255, 255, 40), 1, Qt.DashLine))
+        painter.drawLine(r.left(), r.bottom(), r.right(), r.top())
+
+        # The curve, sampled from the LUT.
+        lut = tc_ops.curve_to_lut(self._points, size=max(2, r.width()))
+        painter.setPen(QPen(QColor(212, 168, 83), 2))
+        prev = None
+        for x in range(r.width()):
+            wx = r.left() + x
+            wy = r.bottom() - float(lut[x]) * r.height()
+            if prev is not None:
+                painter.drawLine(int(prev[0]), int(prev[1]), int(wx), int(wy))
+            prev = (wx, wy)
+
+        # Control points.
+        for px, py in self._points:
+            wx, wy = self._to_widget(px, py)
+            painter.setBrush(QColor(255, 255, 255))
+            painter.setPen(QPen(QColor(40, 40, 40), 1))
+            painter.drawEllipse(int(wx - 4), int(wy - 4), 8, 8)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        x, y = self._to_norm(event.position().x(), event.position().y())
+        idx = tc_ops.nearest_point(self._points, x, y, self._TOL)
+        if self._start_cb is not None:
+            self._start_cb()
+        if idx is None:
+            self._points, idx = tc_ops.add_point(self._points, x, y)
+            self._emit_change()
+        self._drag_index = idx
+        self.update()
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_index is None:
+            return super().mouseMoveEvent(event)
+        x, y = self._to_norm(event.position().x(), event.position().y())
+        self._points = tc_ops.move_point(self._points, self._drag_index, x, y)
+        self._emit_change()
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._drag_index is not None:
+            self._drag_index = None
+            if self._commit_cb is not None:
+                self._commit_cb()
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        x, y = self._to_norm(event.position().x(), event.position().y())
+        idx = tc_ops.nearest_point(self._points, x, y, self._TOL)
+        if idx is not None:
+            new_points = tc_ops.remove_point(self._points, idx)
+            if new_points != self._points:
+                if self._start_cb is not None:
+                    self._start_cb()
+                self._points = new_points
+                self._emit_change()
+                if self._commit_cb is not None:
+                    self._commit_cb()
+        self.update()
+        event.accept()
+
+    def _emit_change(self):
+        if self._change_cb is not None:
+            self._change_cb([list(p) for p in self._points])
 
 
 class PreviewRenderSignals(QObject):
@@ -789,6 +1222,9 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._compare_mode = "off"
         self._split_position = 0.5
         self._compare_restore_mode = None
+        self._framing = default_framing()
+        self._crop_edit_enabled = False
+        self._wb_pick_enabled = False
         self._active_layer = "global"
         self._show_mask = False
         self._mask_debug_mode = "tint"
@@ -797,6 +1233,9 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._mask_paint_mode = "paint"
         self._mask_brush_size = 24
         self._mask_brush_hardness = 100
+        self._mask_adjustments = default_mask_adjustments()
+        self._mask_adjustment_sliders = {}
+        self._mask_adjustment_labels = {}
         self._mask_history = []
         self._mask_history_index = -1
         self._max_mask_history = 40
@@ -1002,6 +1441,11 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
         self.compare_hint_label = QLabel("Hold Space: original")
         preview_layout.addWidget(self.compare_hint_label)
+
+        preview_layout.addWidget(QLabel("Histogram"))
+        self.histogram_widget = HistogramWidget(self)
+        preview_layout.addWidget(self.histogram_widget)
+
         workspace_layout.addWidget(preview_card)
         left_layout.addWidget(self._make_collapsible_section("Workspace", workspace_content, expanded=True))
 
@@ -1035,6 +1479,21 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.mask_debug_label = QLabel("Mask: --")
         self.mask_debug_label.setWordWrap(True)
         mask_layout.addWidget(self.mask_debug_label)
+
+        mask_layout.addWidget(QLabel("Mask Settings"))
+        for key, label, mn, mx in (
+            ("strength", "Strength", 0, 200),
+            ("feather", "Feather", 0, 40),
+            ("expand", "Expand", -40, 40),
+        ):
+            mask_layout.addLayout(self._build_mask_adjustment_row(key, label, mn, mx))
+
+        reset_settings_row = QHBoxLayout()
+        reset_settings_row.addStretch(1)
+        self.reset_mask_settings_btn = QPushButton("Reset Settings")
+        self.reset_mask_settings_btn.clicked.connect(self._reset_active_mask_settings)
+        reset_settings_row.addWidget(self.reset_mask_settings_btn)
+        mask_layout.addLayout(reset_settings_row)
 
         brush_row = QHBoxLayout()
         brush_row.addWidget(QLabel("Brush"))
@@ -1081,6 +1540,182 @@ class PortraitEnhancerQtWindow(QMainWindow):
         history_row.addWidget(self.redo_mask_btn)
         mask_layout.addLayout(history_row)
         left_layout.addWidget(self._make_collapsible_section("Mask Tools", mask_content, expanded=False))
+
+        geometry_content = QWidget(self)
+        geometry_layout = QVBoxLayout(geometry_content)
+        geometry_layout.setContentsMargins(8, 4, 8, 4)
+        geometry_layout.setSpacing(8)
+
+        self.crop_edit_btn = QPushButton("Crop")
+        self.crop_edit_btn.setCheckable(True)
+        self.crop_edit_btn.toggled.connect(self._on_crop_edit_toggled)
+        geometry_layout.addWidget(self.crop_edit_btn)
+
+        aspect_row = QHBoxLayout()
+        aspect_row.addWidget(QLabel("Aspect"))
+        self.aspect_combo = QComboBox()
+        self._aspect_presets = [
+            ("Free", None),
+            ("Original", "original"),
+            ("1:1", 1.0),
+            ("4:5", 4.0 / 5.0),
+            ("5:4", 5.0 / 4.0),
+            ("3:2", 3.0 / 2.0),
+            ("2:3", 2.0 / 3.0),
+            ("16:9", 16.0 / 9.0),
+        ]
+        for label, _value in self._aspect_presets:
+            self.aspect_combo.addItem(label)
+        self.aspect_combo.currentIndexChanged.connect(self._on_aspect_preset_changed)
+        aspect_row.addWidget(self.aspect_combo, 1)
+        geometry_layout.addLayout(aspect_row)
+
+        straighten_row = QHBoxLayout()
+        straighten_row.addWidget(QLabel("Straighten"))
+        self.straighten_slider = QSlider(Qt.Horizontal)
+        self.straighten_slider.setRange(-45, 45)
+        self.straighten_slider.setValue(0)
+        self.straighten_slider.valueChanged.connect(self._on_straighten_changed)
+        straighten_row.addWidget(self.straighten_slider, 1)
+        self.straighten_value_label = QLabel("0°")
+        straighten_row.addWidget(self.straighten_value_label)
+        geometry_layout.addLayout(straighten_row)
+
+        flip_row = QHBoxLayout()
+        self.flip_h_btn = QPushButton("Flip H")
+        self.flip_h_btn.clicked.connect(lambda: self._on_flip("flip_h"))
+        flip_row.addWidget(self.flip_h_btn)
+        self.flip_v_btn = QPushButton("Flip V")
+        self.flip_v_btn.clicked.connect(lambda: self._on_flip("flip_v"))
+        flip_row.addWidget(self.flip_v_btn)
+        self.reset_framing_btn = QPushButton("Reset")
+        self.reset_framing_btn.clicked.connect(self._reset_framing)
+        flip_row.addWidget(self.reset_framing_btn)
+        geometry_layout.addLayout(flip_row)
+
+        left_layout.addWidget(self._make_collapsible_section("Geometry", geometry_content, expanded=False))
+
+        wb_content = QWidget(self)
+        wb_layout = QVBoxLayout(wb_content)
+        wb_layout.setContentsMargins(8, 4, 8, 4)
+        wb_layout.setSpacing(8)
+        self.wb_pick_btn = QPushButton("Pick Neutral")
+        self.wb_pick_btn.setCheckable(True)
+        self.wb_pick_btn.setToolTip("Click a should-be-neutral area in the image to remove a color cast")
+        self.wb_pick_btn.toggled.connect(self._on_wb_pick_toggled)
+        wb_layout.addWidget(self.wb_pick_btn)
+        wb_auto_row = QHBoxLayout()
+        self.wb_gray_btn = QPushButton("Auto Gray")
+        self.wb_gray_btn.clicked.connect(self._wb_auto_gray_world)
+        wb_auto_row.addWidget(self.wb_gray_btn)
+        self.wb_white_btn = QPushButton("Auto White")
+        self.wb_white_btn.clicked.connect(self._wb_auto_white_patch)
+        wb_auto_row.addWidget(self.wb_white_btn)
+        self.wb_reset_btn = QPushButton("Reset")
+        self.wb_reset_btn.clicked.connect(self._reset_wb)
+        wb_auto_row.addWidget(self.wb_reset_btn)
+        wb_layout.addLayout(wb_auto_row)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Preset"))
+        self.wb_preset_combo = QComboBox()
+        self.wb_preset_combo.addItem("Custom")
+        for name, _temp, _tint in wb_ops.PRESETS:
+            self.wb_preset_combo.addItem(name)
+        self.wb_preset_combo.activated.connect(self._on_wb_preset_chosen)
+        preset_row.addWidget(self.wb_preset_combo, 1)
+        wb_layout.addLayout(preset_row)
+
+        temp_row = QHBoxLayout()
+        temp_row.addWidget(QLabel("Temp"))
+        self.wb_temp_slider = QSlider(Qt.Horizontal)
+        self.wb_temp_slider.setRange(wb_ops.MIN_K, wb_ops.MAX_K)
+        self.wb_temp_slider.setValue(wb_ops.NEUTRAL_K)
+        self.wb_temp_slider.setToolTip("Color temperature in Kelvin — right is warmer")
+        self.wb_temp_slider.sliderPressed.connect(self._begin_document_change)
+        self.wb_temp_slider.valueChanged.connect(self._on_wb_temp_changed)
+        self.wb_temp_slider.sliderReleased.connect(self._push_document_history)
+        temp_row.addWidget(self.wb_temp_slider, 1)
+        self.wb_temp_value_label = QLabel(f"{wb_ops.NEUTRAL_K}K")
+        temp_row.addWidget(self.wb_temp_value_label)
+        wb_layout.addLayout(temp_row)
+
+        tint_row = QHBoxLayout()
+        tint_row.addWidget(QLabel("Tint"))
+        self.wb_tint_slider = QSlider(Qt.Horizontal)
+        self.wb_tint_slider.setRange(wb_ops.TINT_MIN, wb_ops.TINT_MAX)
+        self.wb_tint_slider.setValue(0)
+        self.wb_tint_slider.setToolTip("Magenta (right) / green (left)")
+        self.wb_tint_slider.sliderPressed.connect(self._begin_document_change)
+        self.wb_tint_slider.valueChanged.connect(self._on_wb_tint_changed)
+        self.wb_tint_slider.sliderReleased.connect(self._push_document_history)
+        tint_row.addWidget(self.wb_tint_slider, 1)
+        self.wb_tint_value_label = QLabel("0")
+        tint_row.addWidget(self.wb_tint_value_label)
+        wb_layout.addLayout(tint_row)
+
+        self.wb_status_label = QLabel("White balance: neutral")
+        wb_layout.addWidget(self.wb_status_label)
+        left_layout.addWidget(self._make_collapsible_section("White Balance", wb_content, expanded=False))
+
+        curve_content = QWidget(self)
+        curve_layout = QVBoxLayout(curve_content)
+        curve_layout.setContentsMargins(8, 4, 8, 4)
+        curve_layout.setSpacing(6)
+        self.tone_curve_widget = ToneCurveWidget(self)
+        self.tone_curve_widget.set_callbacks(
+            self._on_tone_curve_changed, self._on_tone_curve_commit, self._on_tone_curve_start
+        )
+        curve_layout.addWidget(self.tone_curve_widget)
+        curve_reset_row = QHBoxLayout()
+        curve_reset_row.addStretch(1)
+        self.tone_curve_reset_btn = QPushButton("Reset Curve")
+        self.tone_curve_reset_btn.clicked.connect(self._reset_tone_curve)
+        curve_reset_row.addWidget(self.tone_curve_reset_btn)
+        curve_layout.addLayout(curve_reset_row)
+        left_layout.addWidget(self._make_collapsible_section("Tone Curve", curve_content, expanded=False))
+
+        hsl_content = QWidget(self)
+        hsl_layout = QVBoxLayout(hsl_content)
+        hsl_layout.setContentsMargins(8, 4, 8, 4)
+        hsl_layout.setSpacing(8)
+        band_row = QHBoxLayout()
+        band_row.addWidget(QLabel("Color"))
+        self.hsl_band_combo = QComboBox()
+        for name in cm_ops.BAND_NAMES:
+            self.hsl_band_combo.addItem(name.capitalize())
+        self.hsl_band_combo.currentIndexChanged.connect(self._on_hsl_band_changed)
+        band_row.addWidget(self.hsl_band_combo, 1)
+        hsl_layout.addLayout(band_row)
+
+        self.hsl_sliders = {}
+        self.hsl_value_labels = {}
+        for key, label in (("hue", "Hue"), ("sat", "Saturation"), ("lum", "Luminance")):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(-100, 100)
+            slider.setValue(0)
+            slider.sliderPressed.connect(self._begin_document_change)
+            slider.valueChanged.connect(lambda value, k=key: self._on_hsl_slider_changed(k, value))
+            slider.sliderReleased.connect(self._push_document_history)
+            row.addWidget(slider, 1)
+            value_label = QLabel("0")
+            row.addWidget(value_label)
+            hsl_layout.addLayout(row)
+            self.hsl_sliders[key] = slider
+            self.hsl_value_labels[key] = value_label
+
+        hsl_reset_row = QHBoxLayout()
+        hsl_reset_row.addStretch(1)
+        self.hsl_reset_band_btn = QPushButton("Reset Color")
+        self.hsl_reset_band_btn.clicked.connect(self._reset_hsl_band)
+        hsl_reset_row.addWidget(self.hsl_reset_band_btn)
+        self.hsl_reset_all_btn = QPushButton("Reset All")
+        self.hsl_reset_all_btn.clicked.connect(self._reset_hsl_all)
+        hsl_reset_row.addWidget(self.hsl_reset_all_btn)
+        hsl_layout.addLayout(hsl_reset_row)
+        left_layout.addWidget(self._make_collapsible_section("Color Mixer (HSL)", hsl_content, expanded=False))
 
         layers_content = QWidget(self)
         layers_layout = QVBoxLayout(layers_content)
@@ -1191,10 +1826,40 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.image_label = ImagePreviewLabel()
         self.image_label.set_compare_state(self._compare_mode, self._set_split_position)
         self.image_label.set_edit_state(False, self._paint_active_mask_at, self._begin_mask_stroke)
+        self.image_label.set_crop_callbacks(
+            self._on_crop_changed, self._on_crop_committed, self._on_crop_drag_start
+        )
+        self.image_label.set_wb_pick_state(False, self._on_wb_picked)
         right_layout.addWidget(self.image_label, 1)
         root.addWidget(right_panel, 1)
         self._refresh_mask_controls()
         self._refresh_preset_browser()
+
+    def _build_mask_adjustment_row(self, key: str, label: str, mn: int, mx: int):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel(label))
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(int(mn), int(mx))
+        slider.setValue(100 if key == "strength" else 0)
+        slider.sliderPressed.connect(self._begin_document_change)
+        slider.sliderPressed.connect(self._on_slider_drag_started)
+        slider.sliderReleased.connect(self._on_slider_drag_finished)
+        slider.valueChanged.connect(lambda value, name=key: self._on_mask_adjustment_changed(name, value))
+        row.addWidget(slider, 1)
+        value_label = QLabel(self._format_mask_adjustment_value(key, slider.value()))
+        row.addWidget(value_label)
+        self._mask_adjustment_sliders[key] = slider
+        self._mask_adjustment_labels[key] = value_label
+        return row
+
+    def _format_mask_adjustment_value(self, key: str, value: float) -> str:
+        value = int(round(float(value)))
+        if key == "strength":
+            return f"{value}%"
+        if key == "expand":
+            return f"{value:+d}" if value else "0"
+        return str(value)
 
     def _build_layer_tab(self, layer: str, sliders):
         scroll = QScrollArea()
@@ -1302,6 +1967,10 @@ class PortraitEnhancerQtWindow(QMainWindow):
             "working_space": "srgb",
             "output_transform": "srgb",
             "icc_policy": "srgb",
+            "wb_temp_k": wb_ops.NEUTRAL_K,
+            "wb_tint": 0,
+            "tone_curve": [[0.0, 0.0], [1.0, 1.0]],
+            "color_mixer": cm_ops.default_color_mixer(),
         }
 
     def _default_preset_meta(self):
@@ -1424,8 +2093,8 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
         parser_path = parser._resolve_model_path(getattr(parser, "_explicit_model_path", None)) if parser is not None else None
         detector_path = detector._resolve_model_path(None) if detector is not None else None
-        subject_path = subject_segmenter._resolve_model_path(None) if subject_segmenter is not None else None
-        facial_hair_path = facial_hair_segmenter._resolve_model_path(None) if facial_hair_segmenter is not None else None
+        subject_path = subject_segmenter._resolve_model_path() if subject_segmenter is not None else None
+        facial_hair_path = facial_hair_segmenter._resolve_model_path() if facial_hair_segmenter is not None else None
         refiner_path = refiner._resolve_model_path() if refiner is not None else None
 
         lines.append(f"Segmentation: {self.segmenter.backend_label}")
@@ -1560,6 +2229,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 "selective_params": {layer: dict(values) for layer, values in profile.get("selective_params", {}).items()},
                 "layer_options": {layer: dict(cfg) for layer, cfg in profile.get("layer_options", {}).items()},
                 "layer_order": list(profile.get("layer_order", list(MASK_ORDER))),
+                "mask_adjustments": self._copy_mask_adjustments(profile.get("mask_adjustments", {})),
                 "preview_masks": self._copy_masks(profile.get("preview_masks")),
                 "full_masks": self._copy_masks(profile.get("full_masks")),
                 "auto_preview_masks": self._copy_masks(profile.get("auto_preview_masks")),
@@ -1576,6 +2246,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 "selective_params": {layer: dict(values) for layer, values in profile.get("selective_params", {}).items()},
                 "layer_options": {layer: dict(cfg) for layer, cfg in profile.get("layer_options", {}).items()},
                 "layer_order": list(profile.get("layer_order", list(MASK_ORDER))),
+                "mask_adjustments": self._copy_mask_adjustments(profile.get("mask_adjustments", {})),
             }
         return signature
 
@@ -1587,12 +2258,14 @@ class PortraitEnhancerQtWindow(QMainWindow):
             "face_profiles": self._history_face_profile_signature(snapshot.get("face_profiles", {})),
             "compare_mode": snapshot.get("compare_mode", "off"),
             "split_position": snapshot.get("split_position", 0.5),
+            "framing": normalize_framing(snapshot.get("framing")),
             "show_mask": snapshot.get("show_mask", False),
             "mask_debug_mode": snapshot.get("mask_debug_mode", "tint"),
             "show_expression_guides": snapshot.get("show_expression_guides", False),
             "active_layer": snapshot.get("active_layer", "global"),
             "essentials_only": snapshot.get("essentials_only", True),
             "runtime_settings": snapshot.get("runtime_settings", {}),
+            "mask_adjustments": self._copy_mask_adjustments(snapshot.get("mask_adjustments", {})),
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -1606,12 +2279,14 @@ class PortraitEnhancerQtWindow(QMainWindow):
             "face_profiles": self._copy_face_profiles(self._face_profiles),
             "compare_mode": self._compare_mode,
             "split_position": float(self._split_position),
+            "framing": normalize_framing(self._framing),
             "show_mask": bool(self._show_mask),
             "mask_debug_mode": self._mask_debug_mode,
             "show_expression_guides": bool(self._show_expression_guides),
             "active_layer": self._active_layer,
             "essentials_only": bool(self._essentials_only),
             "runtime_settings": dict(self._runtime_settings),
+            "mask_adjustments": self._copy_mask_adjustments(self._mask_adjustments),
         }
 
     def _clear_document_history(self):
@@ -1676,6 +2351,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
             if isinstance(runtime_settings, dict):
                 self._runtime_settings.update(runtime_settings)
 
+            self._mask_adjustments = self._copy_mask_adjustments(snapshot.get("mask_adjustments", {}))
             self._face_profiles = self._copy_face_profiles(snapshot.get("face_profiles", {}))
             if self._detected_faces:
                 self._active_face_index = int(np.clip(int(snapshot.get("active_face_index", 0)), 0, len(self._detected_faces) - 1))
@@ -1684,6 +2360,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
             self._compare_mode = str(snapshot.get("compare_mode", "off") or "off")
             self._split_position = max(0.0, min(1.0, float(snapshot.get("split_position", 0.5))))
+            self._framing = normalize_framing(snapshot.get("framing"))
             self._show_mask = bool(snapshot.get("show_mask", False))
             self._mask_debug_mode = str(snapshot.get("mask_debug_mode", "tint") or "tint")
             self._show_expression_guides = bool(snapshot.get("show_expression_guides", False))
@@ -1714,6 +2391,10 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self.split_slider.blockSignals(False)
             self.image_label.set_compare_state(self._compare_mode, self._set_split_position)
             self.split_slider.setEnabled(self._compare_mode == "split")
+            self._sync_framing_controls()
+            self._sync_wb_controls()
+            self._sync_tone_curve_controls()
+            self._sync_hsl_controls()
 
             if not self._restore_face_profile(self._active_face_index):
                 self.preview_masks = self._copy_masks(self._auto_preview_masks)
@@ -1786,6 +2467,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
             "selective_params": {layer: dict(params.get(layer, {})) for layer in MASK_ORDER},
             "layer_options": {layer: dict(cfg) for layer, cfg in self._layer_options.items()},
             "layer_order": list(self._layer_order),
+            "mask_adjustments": self._copy_mask_adjustments(self._mask_adjustments),
             "preview_masks": self._copy_masks(self.preview_masks),
             "full_masks": self._copy_masks(self.full_masks),
             "auto_preview_masks": self._copy_masks(self._auto_preview_masks),
@@ -1814,6 +2496,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
             if layer not in layer_order:
                 layer_order.append(layer)
         self._layer_order = layer_order
+        self._mask_adjustments = self._copy_mask_adjustments(profile.get("mask_adjustments", {}))
         self.preview_masks = self._copy_masks(profile.get("preview_masks"))
         self.full_masks = self._copy_masks(profile.get("full_masks"))
         self._auto_preview_masks = self._copy_masks(profile.get("auto_preview_masks"))
@@ -1858,6 +2541,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 "selective_params": profile.get("selective_params", {}),
                 "layer_options": profile.get("layer_options", {}),
                 "layer_order": profile.get("layer_order", list(MASK_ORDER)),
+                "mask_adjustments": self._copy_mask_adjustments(profile.get("mask_adjustments", {})),
                 "preview_masks": self._encode_masks(profile.get("preview_masks")),
                 "full_masks": self._encode_masks(profile.get("full_masks")),
                 "auto_preview_masks": self._encode_masks(profile.get("auto_preview_masks")),
@@ -1874,6 +2558,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 "selective_params": profile.get("selective_params", {}),
                 "layer_options": profile.get("layer_options", {}),
                 "layer_order": profile.get("layer_order", list(MASK_ORDER)),
+                "mask_adjustments": self._copy_mask_adjustments(profile.get("mask_adjustments", {})),
                 "preview_masks": self._decode_masks(profile.get("preview_masks")),
                 "full_masks": self._decode_masks(profile.get("full_masks")),
                 "auto_preview_masks": self._decode_masks(profile.get("auto_preview_masks")),
@@ -1896,12 +2581,14 @@ class PortraitEnhancerQtWindow(QMainWindow):
             "face_profiles": self._serialize_face_profiles(),
             "compare_mode": self._compare_mode,
             "split_position": float(self._split_position),
+            "framing": normalize_framing(self._framing),
             "show_mask": bool(self._show_mask),
             "mask_debug_mode": self._mask_debug_mode,
             "show_expression_guides": bool(self._show_expression_guides),
             "active_layer": self._active_layer,
             "essentials_only": bool(self._essentials_only),
             "runtime_settings": dict(self._runtime_settings),
+            "mask_adjustments": self._copy_mask_adjustments(self._mask_adjustments),
         }
 
     def _apply_project_state(self, project):
@@ -1924,6 +2611,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         if isinstance(runtime_settings, dict):
             self._runtime_settings.update(runtime_settings)
 
+        self._mask_adjustments = self._copy_mask_adjustments(project.get("mask_adjustments", {}))
         self._detected_faces = [tuple(int(v) for v in face) for face in project.get("detected_faces", [])]
         self._active_face_index = int(project.get("active_face_index", 0))
         if self._detected_faces:
@@ -1934,6 +2622,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
         self._compare_mode = str(project.get("compare_mode", "off") or "off")
         self._split_position = max(0.0, min(1.0, float(project.get("split_position", 0.5))))
+        self._framing = normalize_framing(project.get("framing"))
         self._show_mask = bool(project.get("show_mask", False))
         self._mask_debug_mode = str(project.get("mask_debug_mode", "tint") or "tint")
         self._show_expression_guides = bool(project.get("show_expression_guides", False))
@@ -1974,6 +2663,10 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self._activate_layer(active_layer)
         self.image_label.set_compare_state(self._compare_mode, self._set_split_position)
         self.split_slider.setEnabled(self._compare_mode == "split")
+        self._sync_framing_controls()
+        self._sync_wb_controls()
+        self._sync_tone_curve_controls()
+        self._sync_hsl_controls()
 
         if not self._restore_face_profile(self._active_face_index):
             self._run_segmentation()
@@ -1994,6 +2687,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
             "selective_params": {layer: dict(params.get(layer, {})) for layer in MASK_ORDER},
             "layer_options": {layer: dict(cfg) for layer, cfg in self._layer_options.items()},
             "layer_order": list(self._layer_order),
+            "mask_adjustments": self._copy_mask_adjustments(self._mask_adjustments),
             "meta": self._default_preset_meta(),
         }
 
@@ -2029,6 +2723,8 @@ class PortraitEnhancerQtWindow(QMainWindow):
             if layer not in layer_order:
                 layer_order.append(layer)
         self._layer_order = layer_order
+        self._mask_adjustments = self._copy_mask_adjustments(preset.get("mask_adjustments", self._mask_adjustments))
+        self._sync_mask_adjustment_controls()
         self._schedule_render()
 
     def open_preset(self):
@@ -2454,6 +3150,9 @@ class PortraitEnhancerQtWindow(QMainWindow):
             slider.setValue(int(defaults[key]))
             slider.blockSignals(False)
             self._slider_value_labels[layer][key].setText(f"{int(defaults[key]):+d}" if int(defaults[key]) else "0")
+        if layer in MASK_ORDER:
+            self._mask_adjustments[layer] = default_mask_adjustments([layer])[layer]
+            self._sync_mask_adjustment_controls()
         self._schedule_render()
 
     def _schedule_render(self):
@@ -2734,8 +3433,311 @@ class PortraitEnhancerQtWindow(QMainWindow):
         if self._mask_edit_enabled and self._mask_history_index < 0:
             self._push_mask_history()
         if self._mask_edit_enabled:
+            if self._crop_edit_enabled and hasattr(self, "crop_edit_btn"):
+                self.crop_edit_btn.setChecked(False)  # mutually exclusive edit modes
+            if self._wb_pick_enabled and hasattr(self, "wb_pick_btn"):
+                self.wb_pick_btn.setChecked(False)
             self._set_section_expanded("Mask Tools", True)
         self._refresh_mask_controls()
+        self._update_preview_label()
+
+    def _sync_framing_controls(self):
+        """Push the current framing state into the Geometry controls and preview."""
+        if not hasattr(self, "straighten_slider"):
+            return
+        framing = normalize_framing(self._framing)
+        self._framing = framing
+        self.straighten_slider.blockSignals(True)
+        self.straighten_slider.setValue(int(round(framing["angle"])))
+        self.straighten_slider.blockSignals(False)
+        self.straighten_value_label.setText(f"{int(round(framing['angle']))}°")
+        if hasattr(self, "crop_edit_btn"):
+            self.crop_edit_btn.blockSignals(True)
+            self.crop_edit_btn.setChecked(self._crop_edit_enabled)
+            self.crop_edit_btn.blockSignals(False)
+        self._update_preview_label()
+
+    def _source_aspect(self) -> float | None:
+        if self.preview_array is None:
+            return None
+        h, w = self.preview_array.shape[:2]
+        if h <= 0:
+            return None
+        return float(w) / float(h)
+
+    def _on_crop_edit_toggled(self, checked: bool):
+        self._crop_edit_enabled = bool(checked)
+        if self._crop_edit_enabled:
+            if self._mask_edit_enabled and hasattr(self, "mask_edit_btn"):
+                self.mask_edit_btn.setChecked(False)  # mutually exclusive edit modes
+            if self._wb_pick_enabled and hasattr(self, "wb_pick_btn"):
+                self.wb_pick_btn.setChecked(False)
+            self._set_section_expanded("Geometry", True)
+        self._update_preview_label()
+
+    def _on_aspect_preset_changed(self, index: int):
+        if index < 0 or index >= len(self._aspect_presets):
+            return
+        _label, value = self._aspect_presets[index]
+        if value == "original":
+            aspect = self._source_aspect()
+        else:
+            aspect = value
+        self._begin_document_change()
+        width = height = 1
+        if self.preview_array is not None:
+            height, width = self.preview_array.shape[:2]
+        self._framing["crop"] = framing_ops.centered_crop_for_aspect(aspect, width, height)
+        self._update_preview_label()
+        self._push_document_history()
+
+    def _on_straighten_changed(self, value: int):
+        self.straighten_value_label.setText(f"{int(value)}°")
+        if abs(float(value) - float(self._framing.get("angle", 0.0))) < 1e-6:
+            return
+        self._begin_document_change()
+        self._framing["angle"] = float(value)
+        self._update_preview_label()
+
+    def _on_flip(self, key: str):
+        self._begin_document_change()
+        self._framing[key] = not bool(self._framing.get(key, False))
+        self._update_preview_label()
+        self._push_document_history()
+
+    def _reset_framing(self):
+        if framing_ops.is_identity(self._framing):
+            return
+        self._begin_document_change()
+        self._framing = default_framing()
+        self._sync_framing_controls()
+        self._sync_wb_controls()
+        self._sync_tone_curve_controls()
+        self._sync_hsl_controls()
+        self._push_document_history()
+
+    def _on_crop_drag_start(self):
+        self._begin_document_change()
+
+    def _on_crop_changed(self, rect):
+        self._framing["crop"] = list(rect)
+
+    def _on_crop_committed(self):
+        self._push_document_history()
+
+    # --- White balance ---------------------------------------------------
+
+    def _current_wb_temp_k(self):
+        return wb_ops.clamp_temp(self._color_settings.get("wb_temp_k", wb_ops.NEUTRAL_K))
+
+    def _current_wb_tint(self):
+        return wb_ops.clamp_tint(self._color_settings.get("wb_tint", 0))
+
+    def _matching_wb_preset(self, temp_k, tint):
+        for name, ptemp, ptint in wb_ops.PRESETS:
+            if int(ptemp) == int(temp_k) and int(ptint) == int(tint):
+                return name
+        return "Custom"
+
+    def _wb_status_text(self, temp_k, tint):
+        if temp_k == wb_ops.NEUTRAL_K and tint == 0:
+            return "White balance: neutral"
+        return f"White balance: {int(temp_k)}K, tint {int(tint):+d}"
+
+    def _sync_wb_controls(self):
+        if not hasattr(self, "wb_status_label"):
+            return
+        temp_k, tint = self._current_wb_temp_k(), self._current_wb_tint()
+        self.wb_temp_slider.blockSignals(True)
+        self.wb_temp_slider.setValue(int(temp_k))
+        self.wb_temp_slider.blockSignals(False)
+        self.wb_temp_value_label.setText(f"{int(temp_k)}K")
+        self.wb_tint_slider.blockSignals(True)
+        self.wb_tint_slider.setValue(int(tint))
+        self.wb_tint_slider.blockSignals(False)
+        self.wb_tint_value_label.setText(f"{int(tint):+d}" if tint else "0")
+        if hasattr(self, "wb_pick_btn"):
+            self.wb_pick_btn.blockSignals(True)
+            self.wb_pick_btn.setChecked(self._wb_pick_enabled)
+            self.wb_pick_btn.blockSignals(False)
+        if hasattr(self, "wb_preset_combo"):
+            self.wb_preset_combo.blockSignals(True)
+            self.wb_preset_combo.setCurrentText(self._matching_wb_preset(temp_k, tint))
+            self.wb_preset_combo.blockSignals(False)
+        gains = wb_ops.kelvin_tint_to_gains(temp_k, tint)
+        self.wb_status_label.setText(self._wb_status_text(temp_k, tint))
+        self.wb_status_label.setToolTip(f"Gain R/G/B: {gains[0]:.2f}, {gains[1]:.2f}, {gains[2]:.2f}")
+
+    def _set_wb_kelvin_tint(self, temp_k, tint):
+        """Set the canonical (Kelvin, tint) WB and re-render (pick/auto/preset)."""
+        self._begin_document_change()
+        self._color_settings["wb_temp_k"] = wb_ops.clamp_temp(temp_k)
+        self._color_settings["wb_tint"] = wb_ops.clamp_tint(tint)
+        self._sync_wb_controls()
+        self._schedule_render()  # WB is applied inside process_global, so re-render
+        self._push_document_history()
+
+    def _on_wb_temp_changed(self, value: int):
+        self._color_settings["wb_temp_k"] = wb_ops.clamp_temp(value)
+        self.wb_temp_value_label.setText(f"{int(value)}K")
+        self._sync_wb_status_only()
+        self._schedule_render()
+
+    def _on_wb_tint_changed(self, value: int):
+        self._color_settings["wb_tint"] = wb_ops.clamp_tint(value)
+        self.wb_tint_value_label.setText(f"{int(value):+d}" if value else "0")
+        self._sync_wb_status_only()
+        self._schedule_render()
+
+    def _on_wb_preset_chosen(self, index: int):
+        if index <= 0:  # "Custom"
+            return
+        name, temp_k, tint = wb_ops.PRESETS[index - 1]
+        self._set_wb_kelvin_tint(temp_k, tint)
+
+    def _sync_wb_status_only(self):
+        temp_k, tint = self._current_wb_temp_k(), self._current_wb_tint()
+        gains = wb_ops.kelvin_tint_to_gains(temp_k, tint)
+        self.wb_status_label.setText(self._wb_status_text(temp_k, tint))
+        self.wb_status_label.setToolTip(f"Gain R/G/B: {gains[0]:.2f}, {gains[1]:.2f}, {gains[2]:.2f}")
+        if hasattr(self, "wb_preset_combo"):
+            self.wb_preset_combo.blockSignals(True)
+            self.wb_preset_combo.setCurrentText(self._matching_wb_preset(temp_k, tint))
+            self.wb_preset_combo.blockSignals(False)
+
+    def _on_wb_pick_toggled(self, checked: bool):
+        self._wb_pick_enabled = bool(checked)
+        if self._wb_pick_enabled:
+            if self._crop_edit_enabled and hasattr(self, "crop_edit_btn"):
+                self.crop_edit_btn.setChecked(False)
+            if self._mask_edit_enabled and hasattr(self, "mask_edit_btn"):
+                self.mask_edit_btn.setChecked(False)
+            self._set_section_expanded("White Balance", True)
+        self.image_label.set_wb_pick_state(self._wb_pick_enabled, self._on_wb_picked)
+        self._update_preview_label()
+
+    def _sample_wb_pixel(self, nx: float, ny: float):
+        arr = self.preview_array
+        if arr is None:
+            return None
+        h, w = arr.shape[:2]
+        px = int(round(nx * (w - 1)))
+        py = int(round(ny * (h - 1)))
+        radius = 2  # 5x5 neighborhood to reduce noise
+        x0 = max(0, px - radius)
+        x1 = min(w, px + radius + 1)
+        y0 = max(0, py - radius)
+        y1 = min(h, py + radius + 1)
+        region = arr[y0:y1, x0:x1, :3]
+        if region.size == 0:
+            return None
+        return region.reshape(-1, 3).mean(axis=0)
+
+    def _on_wb_picked(self, nx: float, ny: float):
+        sample = self._sample_wb_pixel(nx, ny)
+        if sample is None:
+            return
+        # preview_array is in display/source (sRGB) space, so linearize from sRGB.
+        # Invert the neutralizing gains to (Kelvin, tint) so the sliders stay in sync.
+        temp_k, tint = wb_ops.neutral_sample_to_kelvin_tint(sample, working_space="srgb")
+        self._set_wb_kelvin_tint(temp_k, tint)
+
+    def _wb_auto_gray_world(self):
+        if self.preview_array is None:
+            return
+        gains = wb_ops.gray_world_gains(self.preview_array, working_space="srgb")
+        self._set_wb_kelvin_tint(*wb_ops.gains_to_kelvin_tint(gains))
+
+    def _wb_auto_white_patch(self):
+        if self.preview_array is None:
+            return
+        gains = wb_ops.white_patch_gains(self.preview_array, working_space="srgb")
+        self._set_wb_kelvin_tint(*wb_ops.gains_to_kelvin_tint(gains))
+
+    def _reset_wb(self):
+        self._set_wb_kelvin_tint(wb_ops.NEUTRAL_K, 0)
+
+    # --- Tone curve ------------------------------------------------------
+
+    def _current_tone_curve(self):
+        return tc_ops.normalize_curve(self._color_settings.get("tone_curve", tc_ops.default_curve()))
+
+    def _sync_tone_curve_controls(self):
+        if not hasattr(self, "tone_curve_widget"):
+            return
+        self.tone_curve_widget.set_points(self._current_tone_curve())
+
+    def _on_tone_curve_start(self):
+        self._begin_document_change()
+
+    def _on_tone_curve_changed(self, points):
+        # Reassign (never mutate in place) so history snapshots stay independent.
+        self._color_settings["tone_curve"] = [list(p) for p in tc_ops.normalize_curve(points)]
+        self._schedule_render()
+
+    def _on_tone_curve_commit(self):
+        self._push_document_history()
+
+    def _reset_tone_curve(self):
+        if tc_ops.is_identity(self._current_tone_curve()):
+            return
+        self._begin_document_change()
+        self._color_settings["tone_curve"] = [list(p) for p in tc_ops.default_curve()]
+        self._sync_tone_curve_controls()
+        self._schedule_render()
+        self._push_document_history()
+
+    # --- HSL color mixer -------------------------------------------------
+
+    def _current_color_mixer(self):
+        return cm_ops.normalize_color_mixer(self._color_settings.get("color_mixer"))
+
+    def _active_hsl_band(self):
+        idx = self.hsl_band_combo.currentIndex() if hasattr(self, "hsl_band_combo") else 0
+        return cm_ops.BAND_NAMES[max(0, min(len(cm_ops.BAND_NAMES) - 1, idx))]
+
+    def _sync_hsl_controls(self):
+        if not hasattr(self, "hsl_sliders"):
+            return
+        band = self._current_color_mixer()[self._active_hsl_band()]
+        for key, slider in self.hsl_sliders.items():
+            value = int(band.get(key, 0))
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+            self.hsl_value_labels[key].setText(f"{value:+d}" if value else "0")
+
+    def _on_hsl_band_changed(self, _index: int):
+        self._sync_hsl_controls()  # load the newly selected band's values (no history)
+
+    def _on_hsl_slider_changed(self, key: str, value: int):
+        self.hsl_value_labels[key].setText(f"{int(value):+d}" if value else "0")
+        # Reassign a fresh mixer dict so history snapshots stay independent.
+        mixer = self._current_color_mixer()
+        mixer[self._active_hsl_band()][key] = int(value)
+        self._color_settings["color_mixer"] = mixer
+        self._schedule_render()
+
+    def _reset_hsl_band(self):
+        band = self._active_hsl_band()
+        mixer = self._current_color_mixer()
+        if all(v == 0 for v in mixer[band].values()):
+            return
+        self._begin_document_change()
+        mixer[band] = {p: 0 for p in cm_ops.PARAMS}
+        self._color_settings["color_mixer"] = mixer
+        self._sync_hsl_controls()
+        self._schedule_render()
+        self._push_document_history()
+
+    def _reset_hsl_all(self):
+        if cm_ops.is_identity(self._current_color_mixer()):
+            return
+        self._begin_document_change()
+        self._color_settings["color_mixer"] = cm_ops.default_color_mixer()
+        self._sync_hsl_controls()
+        self._schedule_render()
+        self._push_document_history()
 
     def _on_mask_mode_changed(self, mode: str):
         self._mask_paint_mode = str(mode or "paint")
@@ -2777,6 +3779,47 @@ class PortraitEnhancerQtWindow(QMainWindow):
             hardness=self._mask_brush_hardness,
         )
 
+    def _on_mask_adjustment_changed(self, key: str, value: int):
+        if self._active_layer not in MASK_ORDER:
+            return
+        current = self._mask_adjustments.setdefault(self._active_layer, default_mask_adjustments([self._active_layer])[self._active_layer])
+        old_value = int(round(float(current.get(key, 100 if key == "strength" else 0))))
+        if int(value) != old_value:
+            self._begin_document_change()
+        current[key] = float(value)
+        if key in self._mask_adjustment_labels:
+            self._mask_adjustment_labels[key].setText(self._format_mask_adjustment_value(key, value))
+        self._update_mask_debug_label()
+        self._update_preview_label()
+        self._schedule_render()
+
+    def _reset_active_mask_settings(self):
+        if self._active_layer not in MASK_ORDER:
+            return
+        self._begin_document_change()
+        defaults = default_mask_adjustments([self._active_layer])[self._active_layer]
+        self._mask_adjustments[self._active_layer] = dict(defaults)
+        self._sync_mask_adjustment_controls()
+        self._update_mask_debug_label()
+        self._update_preview_label()
+        self._schedule_render()
+
+    def _sync_mask_adjustment_controls(self):
+        editable = self._active_layer in MASK_ORDER and self.preview_masks is not None
+        defaults = default_mask_adjustments([self._active_layer])[self._active_layer] if self._active_layer in MASK_ORDER else {}
+        settings = normalize_mask_adjustments({self._active_layer: self._mask_adjustments.get(self._active_layer, defaults)}).get(self._active_layer, defaults)
+        for key, slider in self._mask_adjustment_sliders.items():
+            value = int(round(float(settings.get(key, defaults.get(key, 100 if key == "strength" else 0)))))
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+            slider.setEnabled(editable)
+            if key in self._mask_adjustment_labels:
+                self._mask_adjustment_labels[key].setText(self._format_mask_adjustment_value(key, value))
+                self._mask_adjustment_labels[key].setEnabled(editable)
+        if hasattr(self, "reset_mask_settings_btn"):
+            self.reset_mask_settings_btn.setEnabled(editable)
+
     def _refresh_mask_controls(self):
         editable = self._active_layer in MASK_ORDER and self.preview_masks is not None
         self.mask_view_btn.setEnabled(editable)
@@ -2788,6 +3831,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.hardness_slider.setEnabled(editable)
         self.reset_mask_btn.setEnabled(editable)
         self.feather_mask_btn.setEnabled(editable)
+        self._sync_mask_adjustment_controls()
         if not editable and self._mask_edit_enabled:
             self.mask_edit_btn.blockSignals(True)
             self.mask_edit_btn.setChecked(False)
@@ -2941,6 +3985,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._interactive_preview_array = interactive_preview
         self._interactive_preview_ratio = interactive_ratio
         self._face_profiles = {}
+        self._mask_adjustments = default_mask_adjustments()
         self.preview_masks = None
         self.full_masks = None
         self._auto_preview_masks = None
@@ -2950,6 +3995,11 @@ class PortraitEnhancerQtWindow(QMainWindow):
         if project_state is not None:
             self._apply_project_state(project_state)
         else:
+            self._framing = default_framing()
+            self._sync_framing_controls()
+            self._sync_wb_controls()
+            self._sync_tone_curve_controls()
+            self._sync_hsl_controls()
             self._run_segmentation()
             self._clear_document_history()
             self._push_document_history()
@@ -3237,6 +4287,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.preview_image = result
         self._update_perf_label()
         self._update_preview_label()
+        self._update_histogram()
         if self._render_pending:
             self._schedule_render()
 
@@ -3251,6 +4302,26 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._update_perf_label()
         if self._render_pending:
             self._schedule_render()
+
+    def _update_histogram(self):
+        widget = getattr(self, "histogram_widget", None)
+        curve = getattr(self, "tone_curve_widget", None)
+        if widget is None:
+            return
+        if self.preview_image is None:
+            widget.clear()
+            if curve is not None:
+                curve.set_histogram(None)
+            return
+        try:
+            hist = compute_histogram(self.preview_image)
+            widget.set_histogram(hist)
+            if curve is not None:
+                curve.set_histogram(hist)
+        except Exception:
+            widget.clear()
+            if curve is not None:
+                curve.set_histogram(None)
 
     def _update_perf_label(self):
         def fmt(value):
@@ -3282,17 +4353,36 @@ class PortraitEnhancerQtWindow(QMainWindow):
             f"refine={refine_mode}"
         )
 
+    def _display_framing(self):
+        """Framing to apply to the preview display for the current edit mode.
+
+        Mask editing operates in source space, so it sees no framing; crop-edit
+        mode shows the full straightened frame with a crop-box overlay; otherwise
+        the crop is baked into the preview.
+        """
+        if self._mask_edit_enabled or self._wb_pick_enabled:
+            return default_framing()
+        framing = normalize_framing(self._framing)
+        if self._crop_edit_enabled:
+            return {**framing, "crop": list(framing_ops.DEFAULT_CROP)}
+        return framing
+
     def _update_preview_label(self):
         if self.preview_image is None:
             return
         edited = self.preview_image.convert("RGB")
         edited = self._apply_mask_overlay(edited)
         edited = self._apply_expression_guide_overlay(edited)
+        display_framing = self._display_framing()
+        edited = apply_framing(edited, display_framing)
         if self.preview_array is None:
             image = edited
         else:
             original = Image.fromarray(to_uint8(self.preview_array)).convert("RGB")
+            original = apply_framing(original, display_framing)
             image = self._compose_compare_image(original, edited)
+        crop_overlay = self._framing["crop"] if self._crop_edit_enabled else None
+        self.image_label.set_crop_overlay(crop_overlay)
         data = image.tobytes("raw", "RGB")
         qimage = QImage(data, image.width, image.height, image.width * 3, QImage.Format_RGB888).copy()
         self.image_label.set_preview_pixmap(QPixmap.fromImage(qimage))
@@ -3309,7 +4399,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 self.mask_debug_label.setText("Mask: --")
             return
 
-        mask = self.preview_masks[self._active_layer]
+        mask = self._active_preview_mask()
         if mask is None or mask.size == 0:
             self.mask_debug_label.setText("Mask: --")
             return
@@ -3414,17 +4504,36 @@ class PortraitEnhancerQtWindow(QMainWindow):
     def _copy_params(self, params):
         return {layer: dict(values) for layer, values in (params or {}).items()}
 
+    def _copy_mask_adjustments(self, adjustments):
+        return {layer: dict(values) for layer, values in normalize_mask_adjustments(adjustments).items()}
+
+    def _adjusted_masks(self, masks):
+        return apply_mask_adjustments(
+            masks,
+            self._mask_adjustments,
+            acceleration=self._runtime_settings.get("acceleration_mode", "auto"),
+        )
+
+    def _active_preview_mask(self):
+        if self.preview_masks is None or self._active_layer not in self.preview_masks:
+            return None
+        adjusted = self._adjusted_masks({self._active_layer: self.preview_masks[self._active_layer]})
+        if not adjusted:
+            return None
+        return adjusted.get(self._active_layer)
+
     def _current_preview_render_inputs(self):
         if self.preview_array is None:
             return None, None, None
         if self._slider_drag_active <= 0 or self._interactive_preview_array is None:
             return (
                 self.preview_array.copy(),
-                self._copy_masks(self.preview_masks),
+                self._adjusted_masks(self.preview_masks),
                 self._copy_guides(self.preview_guides),
             )
         ratio = float(self._interactive_preview_ratio)
         masks = self._scale_masks(self.preview_masks, self._interactive_preview_array.shape[:2])
+        masks = self._adjusted_masks(masks)
         guides = _scale_expression_guides(self.preview_guides, ratio, ratio)
         return self._interactive_preview_array.copy(), masks, self._copy_guides(guides)
 
@@ -3491,7 +4600,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
     def _apply_mask_overlay(self, edited: Image.Image) -> Image.Image:
         if not self._show_mask or self.preview_masks is None or self._active_layer not in self.preview_masks:
             return edited
-        mask = self.preview_masks[self._active_layer]
+        mask = self._active_preview_mask()
         if mask is None:
             return edited
         mask = np.clip(mask.astype(np.float32), 0.0, 1.0)
@@ -3607,13 +4716,14 @@ class PortraitEnhancerQtWindow(QMainWindow):
             result = process_all_layers(
                 self.full_array,
                 self._all_params(),
-                self.full_masks,
+                self._adjusted_masks(self.full_masks),
                 geometry=self.full_guides,
                 layer_order=self._layer_order,
                 layer_options=self._layer_options,
                 color_settings=self._color_settings,
                 runtime_settings=self._runtime_settings,
             )
+            result = apply_framing(result, self._framing)
             result.save(out_path)
             self.statusBar().showMessage(f"Exported {out_path}")
         except Exception as ex:
@@ -3632,6 +4742,13 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self.preview_masks = self._copy_masks(self._auto_preview_masks)
         if self._auto_full_masks is not None:
             self.full_masks = self._copy_masks(self._auto_full_masks)
+        self._mask_adjustments = default_mask_adjustments()
+        self._sync_mask_adjustment_controls()
+        self._framing = default_framing()
+        self._sync_framing_controls()
+        self._sync_wb_controls()
+        self._sync_tone_curve_controls()
+        self._sync_hsl_controls()
         self._clear_mask_history()
         if self.preview_masks is not None:
             self._push_mask_history()

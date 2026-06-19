@@ -20,6 +20,7 @@ except ImportError:
     HAS_RAWPY = False
 
 from portrait_enhancer.config import MASK_ORDER
+from portrait_enhancer.core.masks import apply_mask_adjustments
 from portrait_enhancer.core.processing import process_all_layers
 from portrait_enhancer.core.segmentation import FaceSegmenter
 
@@ -182,6 +183,7 @@ def run_batch_job(job: dict):
 
     render_params = _get_preset_render_params(preset)
     color_settings = _get_preset_color_settings(preset)
+    mask_adjustments = preset.get("mask_adjustments", {})
     layer_options = preset.get("layer_options", {})
     layer_order = tuple([layer for layer in preset.get("layer_order", MASK_ORDER) if layer in MASK_ORDER] or MASK_ORDER)
     for layer in MASK_ORDER:
@@ -223,6 +225,11 @@ def run_batch_job(job: dict):
         try:
             full = _read_image_file(path)
             masks, guides, _face_count = _combine_face_masks(full, segmenter)
+            masks = apply_mask_adjustments(
+                masks,
+                mask_adjustments,
+                acceleration=runtime_settings.get("acceleration_mode", "auto"),
+            )
             result = process_all_layers(
                 full,
                 render_params,
