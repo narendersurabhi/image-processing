@@ -1638,6 +1638,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._slider_drag_active = 0
         self._focus_mode = False
         self._focus_restore = None
+        self._settings_clipboard = None
 
         self._color_settings = self._default_color_settings()
         self._runtime_settings = {"acceleration_mode": "auto"}
@@ -1865,30 +1866,16 @@ class PortraitEnhancerQtWindow(QMainWindow):
         reset_action = QAction("Reset", self)
         reset_action.triggered.connect(self.reset_all)
 
-        toolbar = self.addToolBar("Main")
-        self._main_toolbar = toolbar
-        toolbar.setObjectName("MainToolbar")
-        toolbar.setMovable(False)
-        toolbar.setIconSize(QSize(18, 18))
-        toolbar.addAction(open_action)
-        toolbar.addAction(open_project_action)
-        toolbar.addAction(save_project_action)
-        toolbar.addSeparator()
-        toolbar.addAction(undo_action)
-        toolbar.addAction(redo_action)
-        toolbar.addSeparator()
-        toolbar.addAction(open_preset_action)
-        toolbar.addAction(save_preset_action)
-        toolbar.addAction(recipes_action)
-        toolbar.addSeparator()
-        toolbar.addAction(check_action)
-        toolbar.addAction(batch_export_action)
-        toolbar.addAction(batch_jobs_action)
-        toolbar.addAction(retry_failed_action)
-        toolbar.addAction(reset_action)
-        spacer = QWidget(self)
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        toolbar.addWidget(spacer)
+        copy_settings_action = QAction("Copy Settings", self)
+        copy_settings_action.setShortcut("Ctrl+Alt+C")
+        copy_settings_action.triggered.connect(self._copy_settings)
+
+        paste_settings_action = QAction("Paste Settings", self)
+        paste_settings_action.setShortcut("Ctrl+Alt+V")
+        paste_settings_action.triggered.connect(self._paste_settings)
+        self._paste_settings_action = paste_settings_action
+
+        self._main_toolbar = None
 
         # View toggles: collapse the side panels / all chrome to enlarge the canvas.
         self._left_panel_action = QAction("◧ Left", self)
@@ -1908,15 +1895,28 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._focus_action.setShortcut("Ctrl+Shift+F")
         self._focus_action.setToolTip("Focus mode — hide all panels and bars (Ctrl+Shift+F)")
         self._focus_action.toggled.connect(self._on_focus_mode_toggled)
-        toolbar.addAction(self._left_panel_action)
-        toolbar.addAction(self._right_panel_action)
-        toolbar.addAction(self._focus_action)
-        toolbar.addSeparator()
-        toolbar.addAction(export_action)
-        # Register on the window too so the shortcuts work even when the toolbar
-        # itself is hidden in focus mode.
-        for view_action in (self._left_panel_action, self._right_panel_action, self._focus_action):
-            self.addAction(view_action)
+        for action in (
+            open_action,
+            open_project_action,
+            save_project_action,
+            undo_action,
+            redo_action,
+            open_preset_action,
+            save_preset_action,
+            recipes_action,
+            check_action,
+            batch_export_action,
+            batch_jobs_action,
+            retry_failed_action,
+            reset_action,
+            export_action,
+            copy_settings_action,
+            paste_settings_action,
+            self._left_panel_action,
+            self._right_panel_action,
+            self._focus_action,
+        ):
+            self.addAction(action)
 
         def make_button(text: str, callback, primary: bool = False):
             button = QPushButton(text, self)
@@ -2100,6 +2100,27 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.split_slider.setEnabled(self._compare_mode == "split")
         self.split_slider.valueChanged.connect(self._on_split_slider_changed)
         preview_controls.addWidget(self.split_slider)
+        preview_controls.addSpacing(12)
+
+        self.copy_settings_btn = QPushButton("Copy Settings", self)
+        self.copy_settings_btn.setToolTip("Copy global and selective adjustments (Ctrl+Alt+C)")
+        self.copy_settings_btn.setMaximumWidth(120)
+        self.copy_settings_btn.clicked.connect(self._copy_settings)
+        preview_controls.addWidget(self.copy_settings_btn)
+
+        self.paste_settings_btn = QPushButton("Paste Settings", self)
+        self.paste_settings_btn.setToolTip("Paste settings to this image (Ctrl+Alt+V)")
+        self.paste_settings_btn.setMaximumWidth(120)
+        self.paste_settings_btn.setEnabled(False)
+        self.paste_settings_btn.clicked.connect(self._paste_settings)
+        self._paste_settings_btn = self.paste_settings_btn
+        preview_controls.addWidget(self.paste_settings_btn)
+
+        self.settings_indicator = QLabel("", self)
+        self.settings_indicator.setObjectName("MutedLabel")
+        self.settings_indicator.setMaximumWidth(80)
+        preview_controls.addWidget(self.settings_indicator)
+
         canvas_header_layout.addLayout(preview_controls)
         center_layout.addWidget(canvas_header)
 
@@ -2158,7 +2179,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         quick_layer_row.setContentsMargins(0, 0, 0, 0)
         quick_layer_row.setSpacing(4)
         for layer in self.BASIC_LAYERS:
-            button = QToolButton(self)
+            button = QPushButton(self)
             button.setText(layer.title())
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button.clicked.connect(lambda _checked=False, layer_name=layer: self._activate_layer(layer_name))
@@ -2583,6 +2604,10 @@ class PortraitEnhancerQtWindow(QMainWindow):
         label.setObjectName("GroupHeader")
         return label
 
+    def _section_button_text(self, title: str, expanded: bool) -> str:
+        marker = "v" if expanded else ">"
+        return f"{marker} {title}"
+
     def _make_collapsible_section(self, title: str, content: QWidget, expanded: bool = True):
         expanded = bool(self._section_state.get(title, expanded))
         wrapper = QWidget(self)
@@ -2590,12 +2615,11 @@ class PortraitEnhancerQtWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        header = QToolButton(self)
-        header.setText(title)
+        header = QPushButton(self)
+        header.setText(self._section_button_text(title, expanded))
+        header.setProperty("section_title", title)
         header.setCheckable(True)
         header.setChecked(bool(expanded))
-        header.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        header.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         header.clicked.connect(lambda checked, widget=content, button=header: self._toggle_section(widget, button, checked))
         outer.addWidget(header)
         outer.addWidget(content)
@@ -2606,10 +2630,10 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._section_state[title] = bool(expanded)
         return wrapper
 
-    def _toggle_section(self, content: QWidget, button: QToolButton, expanded: bool):
+    def _toggle_section(self, content: QWidget, button: QPushButton, expanded: bool):
         content.setVisible(bool(expanded))
-        button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
-        title = button.text()
+        title = str(button.property("section_title") or button.text()).strip()
+        button.setText(self._section_button_text(title, expanded))
         if title:
             self._section_state[title] = bool(expanded)
             self._save_browser_state()
@@ -2627,7 +2651,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         button.setChecked(bool(expanded))
         button.blockSignals(False)
         content.setVisible(bool(expanded))
-        button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        button.setText(self._section_button_text(title, expanded))
         self._section_state[title] = bool(expanded)
         if save:
             self._save_browser_state()
@@ -2971,6 +2995,109 @@ class PortraitEnhancerQtWindow(QMainWindow):
             "runtime_settings": dict(self._runtime_settings),
             "mask_adjustments": self._copy_mask_adjustments(self._mask_adjustments),
         }
+
+    def _copy_settings(self):
+        """Copy global + selective adjustments, layer settings, and color management to clipboard."""
+        if self.preview_array is None:
+            self.statusBar().showMessage("No image loaded — nothing to copy")
+            return
+        self._store_active_face_profile()
+        params = self._all_params()
+        selective_by_face = []
+        for face_idx in sorted(self._face_profiles.keys()):
+            profile = self._face_profiles.get(face_idx)
+            if profile:
+                selective = {layer: dict(profile.get("selective_params", {}).get(layer, {})) for layer in MASK_ORDER}
+                selective_by_face.append({"face_index": face_idx, "params": selective})
+        self._settings_clipboard = {
+            "global_params": dict(params.get("global", {})),
+            "color_settings": dict(self._color_settings),
+            "layer_options": {layer: dict(cfg) for layer, cfg in self._layer_options.items()},
+            "layer_order": list(self._layer_order),
+            "selective_by_face": selective_by_face,
+        }
+        self._paste_settings_action.setEnabled(True)
+        if hasattr(self, '_paste_settings_btn'):
+            self._paste_settings_btn.setEnabled(True)
+        if hasattr(self, 'settings_indicator'):
+            self.settings_indicator.setText("copied ✓")
+        self.statusBar().showMessage("Settings copied ✓")
+
+    def _paste_settings(self):
+        """Paste copied settings to the current image."""
+        if self._settings_clipboard is None:
+            self.statusBar().showMessage("No settings in clipboard")
+            return
+        if self.preview_array is None:
+            self.statusBar().showMessage("No image loaded — nothing to paste to")
+            return
+        self._begin_document_change()
+        clipboard = self._settings_clipboard
+        # Apply global params.
+        global_params = clipboard.get("global_params", {})
+        for key, value in global_params.items():
+            if "global" in self._sliders and key in self._sliders["global"]:
+                slider = self._sliders["global"][key]
+                slider.blockSignals(True)
+                slider.setValue(int(value))
+                slider.blockSignals(False)
+                if "global" in self._slider_value_labels and key in self._slider_value_labels["global"]:
+                    label = self._slider_value_labels["global"][key]
+                    label.setText(f"{int(value):+d}" if value else "0")
+        # Apply color settings.
+        color_settings = clipboard.get("color_settings", {})
+        if isinstance(color_settings, dict):
+            merged = self._default_color_settings()
+            merged.update(color_settings)
+            self._color_settings = merged
+        # Sync tone curve UI if visible.
+        if hasattr(self, '_sync_tone_curve_controls'):
+            self._sync_tone_curve_controls()
+        # Apply layer options and order.
+        layer_options = clipboard.get("layer_options", {})
+        if isinstance(layer_options, dict):
+            for layer in MASK_ORDER:
+                cfg = dict(self._layer_options.get(layer, {}))
+                cfg.update(layer_options.get(layer, {}))
+                self._layer_options[layer] = cfg
+        layer_order = [layer for layer in clipboard.get("layer_order", []) if layer in MASK_ORDER]
+        for layer in MASK_ORDER:
+            if layer not in layer_order:
+                layer_order.append(layer)
+        self._layer_order = layer_order
+        # Sync mask adjustment controls.
+        if hasattr(self, '_sync_mask_adjustment_controls'):
+            self._sync_mask_adjustment_controls()
+        # Apply selective params to detected faces.
+        selective_by_face = clipboard.get("selective_by_face", [])
+        for face_idx, profile_data in enumerate(selective_by_face):
+            if face_idx >= len(self._detected_faces):
+                break
+            key = int(face_idx) if self._detected_faces else -1
+            if key not in self._face_profiles:
+                self._face_profiles[key] = {
+                    "selective_params": {layer: {} for layer in MASK_ORDER},
+                    "layer_options": {layer: {} for layer in MASK_ORDER},
+                    "layer_order": list(MASK_ORDER),
+                    "mask_adjustments": {},
+                    "preview_masks": {},
+                    "full_masks": {},
+                    "auto_preview_masks": {},
+                    "auto_full_masks": {},
+                    "preview_guides": {},
+                    "full_guides": {},
+                }
+            for layer in MASK_ORDER:
+                self._face_profiles[key]["selective_params"][layer] = dict(
+                    profile_data.get("params", {}).get(layer, {})
+                )
+        # Reload the active face profile to update the UI.
+        self._restore_face_profile(self._active_face_index)
+        self._schedule_render()
+        self._push_document_history()
+        if hasattr(self, 'settings_indicator'):
+            self.settings_indicator.setText("")
+        self.statusBar().showMessage("Settings pasted ✓")
 
     def _clear_document_history(self):
         self._document_history = []
@@ -3867,14 +3994,16 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 self._nav_panel.isVisible(),
                 self._inspector_scroll.isVisible(),
             )
-            self._main_toolbar.setVisible(False)
+            if self._main_toolbar is not None:
+                self._main_toolbar.setVisible(False)
             self._canvas_header.setVisible(False)
             self._status_panel.setVisible(False)
             self._nav_panel.setVisible(False)
             self._inspector_scroll.setVisible(False)
         else:
             left, right = self._focus_restore or (True, True)
-            self._main_toolbar.setVisible(True)
+            if self._main_toolbar is not None:
+                self._main_toolbar.setVisible(True)
             self._canvas_header.setVisible(True)
             self._status_panel.setVisible(True)
             self._left_panel_action.setChecked(left)
