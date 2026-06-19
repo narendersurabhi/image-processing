@@ -106,11 +106,13 @@ uv run --extra dev pytest
     - per-mask strength, feather, and expand/contract controls for subject, background, skin, eyes, lips, and hair masks
     - project save/load (`.peproj`)
     - document undo/redo for slider, compare, face-target, and layer-reset changes
-    - startup readiness check and manual `System Check` dialog for model/runtime status
+    - actionable `System Check` readiness panel: per-component status chips (Ready / Fallback / Not installed), plain-language messages, `Open Models Folder`, and `Re-check`
+    - preset browser shows each preset's scope (`Affects: Global / Portrait / Both`)
     - guided built-in portrait recipes from the `Recipes` action
     - saved batch profiles inside the batch dialog for reusing preset/folder/output setups
     - preview rendering through the shared processing pipeline
-    - export current result
+    - Lightroom-style workspace: left navigation/presets, center canvas, right editing inspector grouped by task (Portrait / Masks / Basic / Color)
+    - export dialog: JPEG/PNG/TIFF, JPEG quality, optional long-edge resize, keep-metadata (EXIF/ICC/DPI) toggle, destination + filename preview
 3. The Tk app still has the deeper feature set today for some advanced mask-edit workflows.
 
 ## Project Files

@@ -85,7 +85,7 @@ The standard local-adjustment primitives are missing.
 
 ## P3 — Output & session workflow
 
-- ☐ Export resize / long-edge constraint
+- ☑ Export resize / long-edge constraint *(Qt export dialog, Phase 7b)*
 - ☐ Watermarking on export
 - ☐ Crop-on-export framing
 - ☐ XMP / sidecar metadata write

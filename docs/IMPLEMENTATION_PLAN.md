@@ -288,8 +288,197 @@ adjust leaves red untouched; gray immune; serialize + undo/redo; resets).
 
 ---
 
+## Phase 6 — Editor shell UX redesign
+
+**Goal:** Restructure the Qt app from a flat two-column layout into a Lightroom-style
+workspace — nav / canvas / inspector — and group inspector controls by user intent
+instead of by implementation detail.
+
+**Design**
+- `_build_editor_shell` replaces the old `_build_ui` body with a `QSplitter`
+  (nav panel · canvas column · inspector panel), a dark style sheet
+  (`_apply_window_style`), and a top toolbar for the global actions (open/project/
+  preset/undo/redo/export/system check/batch).
+- Inspector sections are clustered under uppercase group-header labels
+  (`_make_group_header`) so the panel reads as **Portrait** (Workspace, Layers) ·
+  **Masks** (renamed from "Mask Tools") · **Basic** (Geometry, White Balance) ·
+  **Color** (Tone Curve, Color Mixer) rather than a flat list of unrelated cards.
+  Sections themselves are unchanged `_make_collapsible_section` widgets, just
+  reordered and relabeled — no slider wiring touched.
+
+**Implemented as**
+- Edit: `main_window.py` — `_build_editor_shell` (nav/canvas/inspector + style),
+  `_make_group_header`, inspector section reordering, "Mask Tools" → "Masks" rename
+  (including the auto-expand-on-edit reference).
+- Removed ~550 lines of now-unreachable old `_build_ui` body that had been left
+  behind after the initial shell cutover (dead code after an unconditional
+  `return`) — confirmed every widget it built is already built by the new shell
+  before deleting it.
+
+**Resolved in Phase 7:** the Global-slider split and the Export panel called out as
+follow-ups here are now done — see below.
+
+**Out of scope (follow-up):** System Check readiness-panel redesign, preset browser
+thumbnail/category polish, mask confidence status text. Qt has no Color Management /
+Performance panel at all yet (that's Tk-only/legacy today, not a regression from
+this pass).
+
+**Status: ☑ done (this change)** — verified via `py_compile`, a headless
+`PortraitEnhancerQtWindow()` construction (confirms `layer_tabs`/`image_label`/
+`preset_list`/section map all build), an explicit check that toggling mask-edit
+still auto-expands the renamed "Masks" section, and the full suite (118 passed, the
+same 2 pre-existing unrelated failures as `HEAD`).
+
+---
+
+## Phase 7 — Honest "Basic" group + Export panel
+
+Two follow-ups from Phase 6, done together.
+
+### 7a — Split Global out of the layer tabs
+
+**Goal:** Make the **Basic** group honest — Exposure/Highlights/Shadows/Vibrance/etc.
+were still inside the shared `layer_tabs` `QTabWidget` (Layers → Global), so "Basic"
+only really held Geometry + White Balance.
+
+**Design**
+- `_build_layer_tab` split into `_build_slider_stack(layer, sliders, add_stretch)` +
+  a thin scroll wrapper. The Global stack is embedded directly into a new **Global**
+  collapsible section (under the BASIC group header), with no nested scroll area
+  (the inspector scroll handles overflow).
+- `layer_tabs` now iterates `self._tab_layers = [l for l in ALL_LAYERS if l != "global"]`,
+  so the tabs hold only the portrait feature layers. The Global slider dict is still
+  populated under `self._sliders["global"]`, so `_all_params`, preset apply,
+  `reset_all`, and serialization are untouched.
+- Indexing fixed: `_on_layer_changed` maps tab index → `self._tab_layers[index]`;
+  `_activate_layer("global")` expands the Global section and sets `_active_layer`
+  directly instead of switching a tab; the portrait branch sets `_active_layer`
+  explicitly (so restoring `active_layer="subjects"` works even though Subjects is
+  now tab 0 and `setCurrentIndex(0)` would not fire `currentChanged`).
+
+### 7b — Export panel
+
+**Goal:** Replace the bare `getSaveFileName` with a real export dialog.
+
+**Design**
+- New `ExportDialog(QDialog)`: format (JPEG/PNG/TIFF), JPEG quality slider (auto
+  disabled for non-JPEG), optional long-edge resize, keep-metadata toggle (disabled
+  when the source carries none), destination folder + filename with a live
+  "Will save: name.ext · W×H" preview.
+- `_read_image_file` now captures source EXIF/ICC/DPI (`self._source_metadata`)
+  before `exif_transpose`/`convert` drop it; RAW sources carry no metadata.
+- `export_image` renders through the shared pipeline (+ `apply_framing`), applies the
+  resize, re-embeds metadata via `_export_metadata_kwargs` when requested, saves with
+  the chosen format/quality, confirms overwrite, and reports the saved path. Last
+  format/quality are remembered for the next export.
+
+**Status: ☑ done (this change)** — verified headless: source metadata (dpi) captured
+on load; a full `export_image` run produced a resized (long-edge 300 → 300×200) JPEG
+with dpi preserved; format-switch gates the quality row and updates the filename
+preview/ext; restore round-trip of `active_layer` (portrait + global) and global
+slider values confirmed; full suite 118 passed / 2 pre-existing unrelated failures.
+
+**Out of scope (follow-up):** watermarking, crop-on-export presets, XMP sidecar,
+color-profile selection in the export dialog (Qt has no color-management UI yet).
+
+---
+
 ## Later phases
 
 Tracked in [ROADMAP.md](../ROADMAP.md): per-channel RGB curves, manual
 retouching/healing, local-adjustment masks (radial/linear/range), real denoise, and
 output/workflow tooling.
+
+---
+
+## Phase 8 — System Check readiness panel + preset scope
+
+Two remaining redesign items from Phase 6/7.
+
+### 8a — Actionable System Check
+
+**Goal:** Replace the raw text-blob readiness report (and raw backend errors like
+`onnxruntime unavailable: No module named 'onnxruntime'`) with an actionable
+per-component panel.
+
+**Design**
+- `_readiness_items()` returns structured rows — `(items, has_issues, models_dir)`,
+  each item `{name, status: ready|fallback|off, message, detail}` for Face parsing,
+  Face detector, Subject selection, Facial hair, Face refiner. The issue signal is
+  the same `reason_unavailable` the old report used, so behavior is unchanged; only
+  the presentation is restructured. `_humanize_reason` turns raw import/model errors
+  into plain language ("ONNX Runtime is not installed — advanced portrait masks use
+  fallback mode."), keeping the raw string in a tooltip.
+- `ReadinessDialog` now renders status chips (green Ready / amber Fallback / gray
+  Not installed), a one-line summary, an **Open Models Folder** action
+  (`QDesktopServices`), and a **Re-check** button wired to `_readiness_items` that
+  repopulates in place. Both `show_system_check` and the startup readiness path use
+  it.
+
+### 8b — Preset scope badge
+
+**Goal:** Show, per the redesign spec, whether a library/recent preset affects
+**Global** edits, **Portrait** layers, or **both**.
+
+**Design**
+- `_preset_scope_label(preset)` compares stored `global_params` / `color_settings`
+  against defaults (→ Global) and `selective_params` / `layer_options` against
+  defaults (→ Portrait), yielding "Global only" / "Portrait only" /
+  "Global + Portrait" / "No adjustments". Surfaced as an `Affects:` line in the
+  preset meta panel (both the library-entry and recent-preset branches). The browser
+  already had the thumbnail grid, categories, search, hover-preview, and a ★ recent
+  marker; this fills the one missing spec item.
+
+**Status: ☑ done (this change)** — verified headless: `_readiness_items` produces 5
+classified rows with humanized messages; the dialog populates chips + summary and
+the Re-check path repopulates cleanly; `_preset_scope_label` returns the right label
+across empty / global-only / portrait-only / both / all-defaults / WB-via-color-
+settings / layer-options-only presets; full suite 118 passed / 2 pre-existing
+unrelated failures.
+
+**Note on testing:** the suite has no Qt-constructing tests by convention (PySide6 is
+behind the `qt` extra, not `dev`; even the entrypoint smoke test avoids importing
+Qt), so these are verified via headless integration rather than a new pytest that
+would fail to import under the default `dev` environment.
+
+**Out of scope (follow-up):** preset favorites/star management and live click-to-
+preview rendering; Open-Models-Folder is the only direct action wired today
+(per-component "install dependency" automation is not).
+
+---
+
+## Phase 9 — Slider responsiveness fixes
+
+Two interaction-latency bugs surfaced once Global sliders moved into the prominent
+Basic section and got dragged heavily.
+
+### 9a — Live preview during a drag
+
+`_schedule_render` restarted the 60ms single-shot debounce on every `valueChanged`,
+so a continuous drag perpetually reset the timer and the preview only updated when
+the drag paused or was released ("not responding immediately"). Fix: while a slider
+drag is active, don't restart an already-running timer — let it fire on its ~60ms
+cadence for live updates. Idle changes still coalesce (debounce preserved); release
+still queues a final full-quality render.
+
+### 9b — UI-thread stall at the start of a drag
+
+`_begin_document_change` (wired to `sliderPressed`) called `_capture_document_state`,
+which **deep-copied full-resolution mask arrays** — twice (`_store_active_face_profile`
++ `_copy_face_profiles`), across every face profile — synchronously on the UI thread
+**at the start of every drag**. Measured at ~**915ms** for a 24MP-class image with 7
+mask layers + a face profile, which is exactly the "the slider lags for a second or
+two, then frees up" report.
+
+Fix: mask arrays are only ever *replaced* in the live state, never mutated in place
+(verified across all write sites), and the one path that needs independent live
+arrays (`_restore_face_profile`) already deep-copies separately. So the
+document-history capture now stores masks by **reference** (`_ref_masks`: a new dict
+sharing the immutable array refs) instead of copying pixels. Capture dropped from
+~915ms to ~0.1ms (~6000×).
+
+**Status: ☑ done (this change)** — verified: capture→live-edit→restore keeps
+snapshots independent (a replaced live array does not alter the stored snapshot, and
+restore yields independent live arrays); a 2-step undo / 1-step redo correctly
+restores both slider values and mask state; timer restarts when idle but holds during
+a drag; full suite 118 passed / 2 pre-existing unrelated failures.

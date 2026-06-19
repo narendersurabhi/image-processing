@@ -23,8 +23,8 @@ try:
 except ImportError:
     HAS_RAWPY = False
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QSize, QEvent, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QSize, QEvent, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -48,6 +48,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
+    QSplitter,
     QToolButton,
     QTabWidget,
     QTextEdit,
@@ -302,6 +304,156 @@ class BatchExportDialog(QDialog):
         }
 
 
+class ExportDialog(QDialog):
+    """Single-image export: format, quality, resize, metadata, destination."""
+
+    FORMATS = (
+        ("JPEG", "jpeg", ".jpg"),
+        ("PNG", "png", ".png"),
+        ("TIFF", "tiff", ".tif"),
+    )
+
+    def __init__(self, parent=None, output_dir="", stem="export", output_format="jpeg",
+                 quality=92, has_metadata=False, source_w=0, source_h=0):
+        super().__init__(parent)
+        self.setWindowTitle("Export Image")
+        self.setModal(True)
+        self.resize(560, 0)
+        self._stem = stem or "export"
+        self._source_w = int(source_w)
+        self._source_h = int(source_h)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        self.format_combo = QComboBox(self)
+        for label, value, _ext in self.FORMATS:
+            self.format_combo.addItem(label, value)
+        idx = self.format_combo.findData(output_format)
+        self.format_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.format_combo.currentIndexChanged.connect(self._on_format_changed)
+        form.addRow("Format", self.format_combo)
+
+        quality_row = QWidget(self)
+        quality_layout = QHBoxLayout(quality_row)
+        quality_layout.setContentsMargins(0, 0, 0, 0)
+        self.quality_slider = QSlider(Qt.Horizontal, self)
+        self.quality_slider.setRange(1, 100)
+        self.quality_slider.setValue(int(quality))
+        self.quality_slider.valueChanged.connect(lambda v: self.quality_value_label.setText(str(int(v))))
+        quality_layout.addWidget(self.quality_slider, 1)
+        self.quality_value_label = QLabel(str(int(quality)), self)
+        quality_layout.addWidget(self.quality_value_label)
+        self.quality_row = quality_row
+        form.addRow("JPEG Quality", quality_row)
+
+        resize_row = QWidget(self)
+        resize_layout = QHBoxLayout(resize_row)
+        resize_layout.setContentsMargins(0, 0, 0, 0)
+        self.resize_check = QCheckBox("Limit long edge to", self)
+        self.resize_check.toggled.connect(self._on_resize_toggled)
+        resize_layout.addWidget(self.resize_check)
+        self.resize_spin = QSpinBox(self)
+        self.resize_spin.setRange(64, 20000)
+        self.resize_spin.setSingleStep(64)
+        longest = max(self._source_w, self._source_h) or 2048
+        self.resize_spin.setValue(min(longest, 2048))
+        self.resize_spin.setSuffix(" px")
+        self.resize_spin.setEnabled(False)
+        self.resize_spin.valueChanged.connect(lambda _v: self._update_preview())
+        resize_layout.addWidget(self.resize_spin)
+        resize_layout.addStretch(1)
+        form.addRow("Resize", resize_row)
+
+        self.metadata_check = QCheckBox("Keep EXIF / ICC / DPI from source", self)
+        self.metadata_check.setChecked(bool(has_metadata))
+        self.metadata_check.setEnabled(bool(has_metadata))
+        if not has_metadata:
+            self.metadata_check.setToolTip("Source has no embeddable metadata (or is a RAW file)")
+        form.addRow("Metadata", self.metadata_check)
+
+        self.dest_edit = QLineEdit(output_dir, self)
+        self.dest_edit.textChanged.connect(lambda _t: self._update_preview())
+        dest_row = QWidget(self)
+        dest_layout = QHBoxLayout(dest_row)
+        dest_layout.setContentsMargins(0, 0, 0, 0)
+        dest_layout.addWidget(self.dest_edit, 1)
+        browse_btn = QPushButton("Browse", self)
+        browse_btn.clicked.connect(self._browse_dest)
+        dest_layout.addWidget(browse_btn)
+        form.addRow("Destination", dest_row)
+
+        self.name_edit = QLineEdit(f"{self._stem}_export", self)
+        self.name_edit.textChanged.connect(lambda _t: self._update_preview())
+        form.addRow("Filename", self.name_edit)
+
+        self.preview_label = QLabel(self)
+        self.preview_label.setObjectName("MutedLabel")
+        self.preview_label.setWordWrap(True)
+        layout.addWidget(self.preview_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.export_btn = buttons.addButton("Export", QDialogButtonBox.AcceptRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._on_format_changed()
+
+    def _current_format(self):
+        return self.format_combo.currentData()
+
+    def _current_ext(self):
+        value = self._current_format()
+        for _label, fmt, ext in self.FORMATS:
+            if fmt == value:
+                return ext
+        return ".jpg"
+
+    def _on_format_changed(self):
+        is_jpeg = self._current_format() == "jpeg"
+        self.quality_row.setEnabled(is_jpeg)
+        self._update_preview()
+
+    def _on_resize_toggled(self, checked: bool):
+        self.resize_spin.setEnabled(bool(checked))
+        self._update_preview()
+
+    def _browse_dest(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Destination Folder", self.dest_edit.text())
+        if path:
+            self.dest_edit.setText(path)
+
+    def _update_preview(self):
+        ext = self._current_ext()
+        name = self.name_edit.text().strip() or f"{self._stem}_export"
+        dims = ""
+        if self._source_w and self._source_h:
+            w, h = self._source_w, self._source_h
+            if self.resize_check.isChecked():
+                limit = int(self.resize_spin.value())
+                longest = max(w, h)
+                if longest > limit:
+                    scale = limit / float(longest)
+                    w, h = max(1, round(w * scale)), max(1, round(h * scale))
+            dims = f"  ·  {w}×{h}px"
+        self.preview_label.setText(f"Will save: {name}{ext}{dims}")
+
+    def options(self):
+        ext = self._current_ext()
+        name = self.name_edit.text().strip() or f"{self._stem}_export"
+        return {
+            "format": self._current_format(),
+            "ext": ext,
+            "quality": int(self.quality_slider.value()),
+            "resize_long_edge": int(self.resize_spin.value()) if self.resize_check.isChecked() else 0,
+            "keep_metadata": self.metadata_check.isChecked() and self.metadata_check.isEnabled(),
+            "out_path": os.path.join(self.dest_edit.text().strip(), f"{name}{ext}"),
+            "dest_dir": self.dest_edit.text().strip(),
+        }
+
+
 class BatchJobsDialog(QDialog):
     def __init__(self, parent=None, output_dir="", load_jobs_callback=None):
         super().__init__(parent)
@@ -447,25 +599,119 @@ class BatchJobsDialog(QDialog):
 
 
 class ReadinessDialog(QDialog):
-    def __init__(self, report_text: str, parent=None, title: str = "System Check"):
+    """Actionable model/runtime readiness panel with per-component status."""
+
+    STATUS_STYLE = {
+        "ready": ("Ready", "#4f9a5f", "#16241a"),
+        "fallback": ("Fallback", "#caa14a", "#2a2412"),
+        "off": ("Not installed", "#7c8590", "#1b1f26"),
+    }
+
+    def __init__(self, items, parent=None, title="System Check", recheck_callback=None, models_dir=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.resize(760, 520)
+        self.resize(620, 460)
+        self._recheck_callback = recheck_callback
+        self._models_dir = str(models_dir) if models_dir else ""
 
         layout = QVBoxLayout(self)
-        label = QLabel("Runtime readiness and model status")
-        layout.addWidget(label)
+        heading = QLabel("Portrait AI — runtime &amp; model status", self)
+        heading.setStyleSheet("font-size: 15px; font-weight: 700;")
+        layout.addWidget(heading)
+        self.summary_label = QLabel("", self)
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet("color: #9ea4ad;")
+        layout.addWidget(self.summary_label)
 
-        details = QTextEdit(self)
-        details.setReadOnly(True)
-        details.setPlainText(report_text)
-        layout.addWidget(details, 1)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        self._rows_host = QWidget(self)
+        self._rows_layout = QVBoxLayout(self._rows_host)
+        self._rows_layout.setContentsMargins(0, 4, 0, 4)
+        self._rows_layout.setSpacing(6)
+        scroll.setWidget(self._rows_host)
+        layout.addWidget(scroll, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        open_btn = buttons.addButton("Open Models Folder", QDialogButtonBox.ActionRole)
+        open_btn.clicked.connect(self._open_models_folder)
+        if recheck_callback is not None:
+            recheck_btn = buttons.addButton("Re-check", QDialogButtonBox.ActionRole)
+            recheck_btn.clicked.connect(self._recheck)
         buttons.rejected.connect(self.reject)
         buttons.button(QDialogButtonBox.Close).clicked.connect(self.reject)
         layout.addWidget(buttons)
+
+        self._populate(items)
+
+    def _clear_rows(self):
+        while self._rows_layout.count():
+            child = self._rows_layout.takeAt(0)
+            widget = child.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _make_chip(self, status):
+        label_text, fg, bg = self.STATUS_STYLE.get(status, self.STATUS_STYLE["off"])
+        chip = QLabel(label_text)
+        chip.setAlignment(Qt.AlignCenter)
+        chip.setStyleSheet(
+            f"color: {fg}; background: {bg}; border: 1px solid {fg};"
+            "border-radius: 6px; padding: 2px 8px; font-weight: 600;"
+        )
+        return chip
+
+    def _populate(self, items):
+        self._clear_rows()
+        issues = sum(1 for item in items if item.get("status") != "ready")
+        if issues:
+            self.summary_label.setText(
+                f"{issues} of {len(items)} components are in fallback or not installed. "
+                "The app still works — install the optional models below to enable them."
+            )
+        else:
+            self.summary_label.setText("All components are ready.")
+        for item in items:
+            row = QFrame(self)
+            row.setStyleSheet("QFrame { background: #15171d; border: 1px solid #292f3a; border-radius: 8px; }")
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(10, 8, 10, 8)
+            row_layout.setSpacing(2)
+            top = QHBoxLayout()
+            name = QLabel(item.get("name", ""))
+            name.setStyleSheet("font-weight: 600; border: 0;")
+            top.addWidget(name)
+            top.addStretch(1)
+            top.addWidget(self._make_chip(item.get("status", "off")))
+            row_layout.addLayout(top)
+            message = QLabel(item.get("message", ""))
+            message.setWordWrap(True)
+            message.setStyleSheet("color: #9ea4ad; border: 0;")
+            detail = item.get("detail", "")
+            if detail:
+                message.setToolTip(detail)
+            row_layout.addWidget(message)
+            self._rows_layout.addWidget(row)
+        self._rows_layout.addStretch(1)
+
+    def _open_models_folder(self):
+        if not self._models_dir:
+            return
+        try:
+            os.makedirs(self._models_dir, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self._models_dir))
+
+    def _recheck(self):
+        if self._recheck_callback is None:
+            return
+        items, _has_issues, models_dir = self._recheck_callback()
+        if models_dir:
+            self._models_dir = str(models_dir)
+        self._populate(items)
 
 
 class RecipeDialog(QDialog):
@@ -1208,6 +1454,9 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.segmenter = FaceSegmenter()
         self.file_path = ""
         self.full_array = None
+        self._source_metadata = {}
+        self._last_export_format = "jpeg"
+        self._last_export_quality = 92
         self.preview_array = None
         self.full_masks = None
         self.preview_masks = None
@@ -1284,8 +1533,180 @@ class PortraitEnhancerQtWindow(QMainWindow):
         QTimer.singleShot(0, self._maybe_show_startup_readiness)
         self.statusBar().showMessage("Ready")
 
-    def _build_ui(self):
+    def _apply_window_style(self):
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background: #0f1115;
+                color: #e7e4dc;
+            }
+            QWidget {
+                color: #e7e4dc;
+                font-size: 13px;
+            }
+            QFrame#SidePanel,
+            QFrame#CanvasHeader,
+            QFrame#CanvasSurface,
+            QFrame#StatusStrip {
+                background: #15171d;
+                border: 1px solid #292f3a;
+                border-radius: 8px;
+            }
+            QFrame#CanvasSurface {
+                background: #090a0d;
+            }
+            QScrollArea#InspectorScroll,
+            QWidget#InspectorPanel,
+            QWidget#InspectorPanel QWidget {
+                background: #15171d;
+            }
+            QScrollArea#InspectorScroll {
+                border: 1px solid #292f3a;
+                border-radius: 8px;
+            }
+            QLabel#AppTitle {
+                color: #f2eadc;
+                font-size: 20px;
+                font-weight: 700;
+            }
+            QLabel#ImageStatus {
+                color: #f2eadc;
+                font-weight: 600;
+            }
+            QLabel#MutedLabel {
+                color: #9ea4ad;
+            }
+            QLabel#GroupHeader {
+                color: #6f7682;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                padding: 10px 2px 2px 2px;
+            }
+            QLabel#PreviewSwatch {
+                background: #101217;
+                border: 1px solid #2a2f38;
+                border-radius: 6px;
+                color: #9ea4ad;
+            }
+            QLabel#ImagePreview {
+                background: #090a0d;
+                color: #8f96a3;
+            }
+            QToolBar#MainToolbar {
+                background: #15171d;
+                border: 0;
+                spacing: 6px;
+                padding: 6px;
+            }
+            QToolButton,
+            QPushButton {
+                background: #232832;
+                border: 1px solid #363d49;
+                border-radius: 6px;
+                padding: 6px 9px;
+                color: #ece8df;
+            }
+            QToolButton:hover,
+            QPushButton:hover {
+                background: #2e3541;
+                border-color: #4b5667;
+            }
+            QToolButton:checked,
+            QPushButton:checked {
+                background: #36475a;
+                border-color: #5b9bd5;
+            }
+            QToolButton:disabled,
+            QPushButton:disabled,
+            QLineEdit:disabled,
+            QComboBox:disabled {
+                background: #181d25;
+                border-color: #252b35;
+                color: #69717d;
+            }
+            QLabel:disabled,
+            QCheckBox:disabled {
+                color: #69717d;
+            }
+            QPushButton#PrimaryButton {
+                background: #d4a853;
+                border-color: #e0bd72;
+                color: #15120a;
+                font-weight: 700;
+            }
+            QPushButton#PrimaryButton:hover {
+                background: #e0bd72;
+            }
+            QLineEdit,
+            QComboBox,
+            QTextEdit,
+            QListWidget {
+                background: #101217;
+                border: 1px solid #2d3440;
+                border-radius: 6px;
+                padding: 5px;
+                selection-background-color: #5b9bd5;
+            }
+            QTabWidget::pane {
+                border: 1px solid #2d3440;
+                border-radius: 6px;
+                background: #101217;
+            }
+            QTabBar::tab {
+                background: #202632;
+                color: #cfd3d8;
+                padding: 7px 9px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background: #d4a853;
+                color: #15120a;
+                font-weight: 700;
+            }
+            QScrollArea {
+                background: transparent;
+                border: 0;
+            }
+            QScrollBar:vertical {
+                background: #101217;
+                width: 10px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #3d4653;
+                border-radius: 5px;
+                min-height: 28px;
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #303846;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #d4a853;
+                border: 1px solid #f0d08c;
+                width: 14px;
+                height: 14px;
+                margin: -6px 0;
+                border-radius: 7px;
+            }
+            QSplitter::handle {
+                background: #0f1115;
+                width: 8px;
+            }
+            QStatusBar {
+                background: #15171d;
+                color: #9ea4ad;
+            }
+            """
+        )
+
+    def _build_editor_shell(self):
         open_action = QAction("Open Image", self)
+        open_action.setShortcut(QKeySequence.Open)
         open_action.triggered.connect(self.open_image)
         undo_action = QAction("Undo", self)
         undo_action.setShortcut(QKeySequence.Undo)
@@ -1319,168 +1740,343 @@ class PortraitEnhancerQtWindow(QMainWindow):
         reset_action.triggered.connect(self.reset_all)
 
         toolbar = self.addToolBar("Main")
+        toolbar.setObjectName("MainToolbar")
+        toolbar.setMovable(False)
+        toolbar.setIconSize(QSize(18, 18))
         toolbar.addAction(open_action)
-        toolbar.addAction(undo_action)
-        toolbar.addAction(redo_action)
         toolbar.addAction(open_project_action)
         toolbar.addAction(save_project_action)
-        toolbar.addAction(recipes_action)
-        toolbar.addAction(check_action)
+        toolbar.addSeparator()
+        toolbar.addAction(undo_action)
+        toolbar.addAction(redo_action)
+        toolbar.addSeparator()
         toolbar.addAction(open_preset_action)
         toolbar.addAction(save_preset_action)
+        toolbar.addAction(recipes_action)
+        toolbar.addSeparator()
+        toolbar.addAction(check_action)
         toolbar.addAction(batch_export_action)
         toolbar.addAction(batch_jobs_action)
         toolbar.addAction(retry_failed_action)
-        toolbar.addAction(export_action)
         toolbar.addAction(reset_action)
+        spacer = QWidget(self)
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
+        toolbar.addAction(export_action)
+
+        def make_button(text: str, callback, primary: bool = False):
+            button = QPushButton(text, self)
+            button.clicked.connect(callback)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            if primary:
+                button.setObjectName("PrimaryButton")
+            return button
 
         central = QWidget(self)
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(0)
 
-        left_panel = QWidget(self)
-        left_panel.setMinimumWidth(360)
-        left_panel.setMaximumWidth(420)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(8)
+        splitter = QSplitter(Qt.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter, 1)
+
+        nav_panel = QFrame(self)
+        nav_panel.setObjectName("SidePanel")
+        nav_panel.setMinimumWidth(280)
+        nav_panel.setMaximumWidth(340)
+        nav_layout = QVBoxLayout(nav_panel)
+        nav_layout.setContentsMargins(12, 12, 12, 12)
+        nav_layout.setSpacing(10)
+
+        title = QLabel("Portrait Enhancer", self)
+        title.setObjectName("AppTitle")
+        nav_layout.addWidget(title)
+        nav_layout.addWidget(make_button("Open Image", self.open_image, primary=True))
+
+        project_grid = QGridLayout()
+        project_grid.setContentsMargins(0, 0, 0, 0)
+        project_grid.setHorizontalSpacing(6)
+        project_grid.setVerticalSpacing(6)
+        project_grid.addWidget(make_button("Open Project", self.open_project), 0, 0)
+        project_grid.addWidget(make_button("Save Project", self.save_project), 0, 1)
+        project_grid.addWidget(make_button("Open Preset", self.open_preset), 1, 0)
+        project_grid.addWidget(make_button("Save Preset", self.save_preset), 1, 1)
+        project_grid.addWidget(make_button("Recipes", self.open_recipe_dialog), 2, 0)
+        project_grid.addWidget(make_button("System Check", self.show_system_check), 2, 1)
+        nav_layout.addLayout(project_grid)
+
+        face_row = QHBoxLayout()
+        face_row.setContentsMargins(0, 0, 0, 0)
+        face_row.addWidget(QLabel("Face Target", self))
+        self.face_combo = QComboBox(self)
+        self.face_combo.addItem("Auto")
+        self.face_combo.currentIndexChanged.connect(self._on_face_changed)
+        face_row.addWidget(self.face_combo, 1)
+        nav_layout.addLayout(face_row)
+
+        batch_grid = QGridLayout()
+        batch_grid.setContentsMargins(0, 0, 0, 0)
+        batch_grid.setHorizontalSpacing(6)
+        batch_grid.setVerticalSpacing(6)
+        batch_grid.addWidget(make_button("Batch Export", self.batch_export), 0, 0)
+        batch_grid.addWidget(make_button("Batch Jobs", self.view_batch_jobs), 0, 1)
+        batch_grid.addWidget(make_button("Retry Failed", self.retry_failed_batch), 1, 0)
+        batch_grid.addWidget(make_button("Export", self.export_image), 1, 1)
+        nav_layout.addLayout(batch_grid)
+
+        preset_content = QWidget(self)
+        preset_layout = QVBoxLayout(preset_content)
+        preset_layout.setContentsMargins(8, 4, 8, 4)
+        preset_layout.setSpacing(8)
+        self.preset_search = QLineEdit(self)
+        self.preset_search.setPlaceholderText("Search presets")
+        self.preset_search.textChanged.connect(self._refresh_preset_browser)
+        self.preset_search.installEventFilter(self)
+        preset_layout.addWidget(self.preset_search)
+
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.addWidget(QLabel("Category", self))
+        self.preset_category_combo = QComboBox(self)
+        self.preset_category_combo.addItem("all")
+        self.preset_category_combo.currentTextChanged.connect(self._on_preset_category_changed)
+        self.preset_category_combo.installEventFilter(self)
+        filter_row.addWidget(self.preset_category_combo, 1)
+        preset_layout.addLayout(filter_row)
+
+        preset_layout.addWidget(QLabel("Recent Presets", self))
+        self.recent_preset_list = QListWidget(self)
+        self.recent_preset_list.setMaximumHeight(88)
+        self.recent_preset_list.setMouseTracking(True)
+        self.recent_preset_list.installEventFilter(self)
+        self.recent_preset_list.itemDoubleClicked.connect(lambda _item: self._apply_selected_recent_preset())
+        self.recent_preset_list.currentRowChanged.connect(lambda _row: self._update_selected_preset_meta())
+        self.recent_preset_list.itemEntered.connect(lambda _item: self._update_selected_preset_meta())
+        preset_layout.addWidget(self.recent_preset_list)
+
+        self.preset_list = QListWidget(self)
+        self.preset_list.setMouseTracking(True)
+        self.preset_list.installEventFilter(self)
+        self.preset_list.setViewMode(QListView.IconMode)
+        self.preset_list.setResizeMode(QListView.Adjust)
+        self.preset_list.setMovement(QListView.Static)
+        self.preset_list.setIconSize(QSize(112, 76))
+        self.preset_list.setGridSize(QSize(132, 116))
+        self.preset_list.setWordWrap(True)
+        self.preset_list.setSpacing(6)
+        self.preset_list.itemDoubleClicked.connect(lambda _item: self._apply_selected_browser_preset())
+        self.preset_list.currentRowChanged.connect(lambda _row: self._update_selected_preset_meta())
+        self.preset_list.itemEntered.connect(lambda _item: self._update_selected_preset_meta())
+        preset_layout.addWidget(self.preset_list, 1)
+
+        self.preset_preview_label = QLabel("No preset preview", self)
+        self.preset_preview_label.setAlignment(Qt.AlignCenter)
+        self.preset_preview_label.setMinimumHeight(104)
+        self.preset_preview_label.setMaximumHeight(128)
+        self.preset_preview_label.setObjectName("PreviewSwatch")
+        preset_layout.addWidget(self.preset_preview_label)
+
+        self.preset_meta_label = QLabel("No preset selected", self)
+        self.preset_meta_label.setWordWrap(True)
+        self.preset_meta_label.setObjectName("MutedLabel")
+        preset_layout.addWidget(self.preset_meta_label)
+
+        preset_btn_grid = QGridLayout()
+        preset_btn_grid.setContentsMargins(0, 0, 0, 0)
+        preset_btn_grid.setHorizontalSpacing(6)
+        preset_btn_grid.setVerticalSpacing(6)
+        self.apply_browser_preset_btn = QPushButton("Apply", self)
+        self.apply_browser_preset_btn.clicked.connect(self._apply_selected_browser_preset)
+        preset_btn_grid.addWidget(self.apply_browser_preset_btn, 0, 0)
+        self.save_browser_preset_btn = QPushButton("Save Here", self)
+        self.save_browser_preset_btn.clicked.connect(self._save_preset_to_library)
+        preset_btn_grid.addWidget(self.save_browser_preset_btn, 0, 1)
+        self.rename_browser_preset_btn = QPushButton("Rename", self)
+        self.rename_browser_preset_btn.clicked.connect(self._rename_selected_browser_preset)
+        preset_btn_grid.addWidget(self.rename_browser_preset_btn, 1, 0)
+        self.delete_browser_preset_btn = QPushButton("Delete", self)
+        self.delete_browser_preset_btn.clicked.connect(self._delete_selected_browser_preset)
+        preset_btn_grid.addWidget(self.delete_browser_preset_btn, 1, 1)
+        self.refresh_browser_preset_btn = QPushButton("Refresh", self)
+        self.refresh_browser_preset_btn.clicked.connect(self._refresh_preset_browser)
+        preset_btn_grid.addWidget(self.refresh_browser_preset_btn, 2, 0, 1, 2)
+        preset_layout.addLayout(preset_btn_grid)
+        nav_layout.addWidget(self._make_collapsible_section("Preset Browser", preset_content, expanded=True), 1)
+
+        center_panel = QWidget(self)
+        center_panel.setObjectName("CanvasColumn")
+        center_layout = QVBoxLayout(center_panel)
+        center_layout.setContentsMargins(10, 0, 10, 0)
+        center_layout.setSpacing(10)
+
+        canvas_header = QFrame(self)
+        canvas_header.setObjectName("CanvasHeader")
+        canvas_header_layout = QVBoxLayout(canvas_header)
+        canvas_header_layout.setContentsMargins(12, 10, 12, 10)
+        canvas_header_layout.setSpacing(8)
+
+        self.info_label = QLabel("No image loaded", self)
+        self.info_label.setObjectName("ImageStatus")
+        self.info_label.setWordWrap(True)
+        self.info_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        canvas_header_layout.addWidget(self.info_label)
+
+        preview_controls = QHBoxLayout()
+        preview_controls.setContentsMargins(0, 0, 0, 0)
+        preview_controls.setSpacing(8)
+        self.compare_hint_label = QLabel("Before/after", self)
+        self.compare_hint_label.setObjectName("MutedLabel")
+        self.compare_hint_label.setToolTip("Hold Space to view the original")
+        preview_controls.addWidget(self.compare_hint_label)
+        preview_controls.addStretch(1)
+        preview_controls.addWidget(QLabel("Compare", self))
+        self.compare_combo = QComboBox(self)
+        self.compare_combo.addItems(["off", "before", "split", "side_by_side"])
+        self.compare_combo.currentTextChanged.connect(self._on_compare_mode_changed)
+        preview_controls.addWidget(self.compare_combo)
+        preview_controls.addWidget(QLabel("Split", self))
+        self.split_slider = QSlider(Qt.Horizontal, self)
+        self.split_slider.setRange(0, 100)
+        self.split_slider.setMaximumWidth(180)
+        self.split_slider.setValue(int(self._split_position * 100))
+        self.split_slider.setEnabled(self._compare_mode == "split")
+        self.split_slider.valueChanged.connect(self._on_split_slider_changed)
+        preview_controls.addWidget(self.split_slider)
+        canvas_header_layout.addLayout(preview_controls)
+        center_layout.addWidget(canvas_header)
+
+        canvas_frame = QFrame(self)
+        canvas_frame.setObjectName("CanvasSurface")
+        canvas_layout = QVBoxLayout(canvas_frame)
+        canvas_layout.setContentsMargins(8, 8, 8, 8)
+        canvas_layout.setSpacing(0)
+        self.image_label = ImagePreviewLabel(self)
+        self.image_label.setObjectName("ImagePreview")
+        self.image_label.set_compare_state(self._compare_mode, self._set_split_position)
+        self.image_label.set_edit_state(False, self._paint_active_mask_at, self._begin_mask_stroke)
+        self.image_label.set_crop_callbacks(
+            self._on_crop_changed, self._on_crop_committed, self._on_crop_drag_start
+        )
+        self.image_label.set_wb_pick_state(False, self._on_wb_picked)
+        canvas_layout.addWidget(self.image_label, 1)
+        center_layout.addWidget(canvas_frame, 1)
+
+        status_panel = QFrame(self)
+        status_panel.setObjectName("StatusStrip")
+        status_layout = QVBoxLayout(status_panel)
+        status_layout.setContentsMargins(12, 8, 12, 10)
+        status_layout.setSpacing(6)
+        self.perf_label = QLabel(
+            "Perf: detect=-- ms | segment=-- ms | render=-- ms | preview=idle | expr=off | refine=off",
+            self,
+        )
+        self.perf_label.setObjectName("MutedLabel")
+        self.perf_label.setWordWrap(True)
+        status_layout.addWidget(self.perf_label)
+        hist_row = QHBoxLayout()
+        hist_row.setContentsMargins(0, 0, 0, 0)
+        hist_row.setSpacing(8)
+        hist_row.addWidget(QLabel("Histogram", self))
+        self.histogram_widget = HistogramWidget(self)
+        hist_row.addWidget(self.histogram_widget, 1)
+        status_layout.addLayout(hist_row)
+        center_layout.addWidget(status_panel)
+
+        inspector_panel = QWidget(self)
+        inspector_panel.setObjectName("InspectorPanel")
+        inspector_panel.setMinimumWidth(380)
+        inspector_panel.setMaximumWidth(480)
+        inspector_layout = QVBoxLayout(inspector_panel)
+        inspector_layout.setContentsMargins(0, 0, 0, 0)
+        inspector_layout.setSpacing(8)
 
         workspace_content = QWidget(self)
         workspace_layout = QVBoxLayout(workspace_content)
         workspace_layout.setContentsMargins(8, 4, 8, 4)
         workspace_layout.setSpacing(8)
 
-        session_card = QFrame(self)
-        session_card.setFrameShape(QFrame.StyledPanel)
-        session_layout = QVBoxLayout(session_card)
-        session_layout.setContentsMargins(8, 8, 8, 8)
-        session_layout.setSpacing(8)
-        session_layout.addWidget(QLabel("Session"))
-
-        face_row = QHBoxLayout()
-        face_row.setContentsMargins(0, 0, 0, 0)
-        face_row.addWidget(QLabel("Face Target"))
-        self.face_combo = QComboBox()
-        self.face_combo.addItem("Auto")
-        self.face_combo.currentIndexChanged.connect(self._on_face_changed)
-        face_row.addWidget(self.face_combo, 1)
-        session_layout.addLayout(face_row)
-
-        quick_actions = QGridLayout()
-        quick_actions.setContentsMargins(0, 0, 0, 0)
-        quick_actions.setHorizontalSpacing(6)
-        quick_actions.setVerticalSpacing(6)
-        recipes_btn = QPushButton("Recipes")
-        recipes_btn.clicked.connect(self.open_recipe_dialog)
-        quick_actions.addWidget(recipes_btn, 0, 0)
-        check_btn = QPushButton("System Check")
-        check_btn.clicked.connect(self.show_system_check)
-        quick_actions.addWidget(check_btn, 0, 1)
-        batch_btn = QPushButton("Batch Export")
-        batch_btn.clicked.connect(self.batch_export)
-        quick_actions.addWidget(batch_btn, 1, 0)
-        jobs_btn = QPushButton("Batch Jobs")
-        jobs_btn.clicked.connect(self.view_batch_jobs)
-        quick_actions.addWidget(jobs_btn, 1, 1)
-        session_layout.addLayout(quick_actions)
-        workspace_layout.addWidget(session_card)
-
-        basics_card = QFrame(self)
-        basics_card.setFrameShape(QFrame.StyledPanel)
-        basics_layout = QVBoxLayout(basics_card)
-        basics_layout.setContentsMargins(8, 8, 8, 8)
-        basics_layout.setSpacing(6)
-        basics_layout.addWidget(QLabel("Portrait Basics"))
         quick_layer_row = QHBoxLayout()
         quick_layer_row.setContentsMargins(0, 0, 0, 0)
+        quick_layer_row.setSpacing(4)
         for layer in self.BASIC_LAYERS:
             button = QToolButton(self)
             button.setText(layer.title())
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button.clicked.connect(lambda _checked=False, layer_name=layer: self._activate_layer(layer_name))
             quick_layer_row.addWidget(button)
-        basics_layout.addLayout(quick_layer_row)
+        workspace_layout.addLayout(quick_layer_row)
 
         org_row = QHBoxLayout()
         org_row.setContentsMargins(0, 0, 0, 0)
-        self.essentials_only_check = QCheckBox("Essentials Only")
+        self.essentials_only_check = QCheckBox("Essentials Only", self)
         self.essentials_only_check.setChecked(self._essentials_only)
         self.essentials_only_check.toggled.connect(self._on_essentials_only_toggled)
         org_row.addWidget(self.essentials_only_check)
-        self.reset_layer_btn = QPushButton("Reset Layer")
+        org_row.addStretch(1)
+        self.reset_layer_btn = QPushButton("Reset Layer", self)
         self.reset_layer_btn.clicked.connect(self._reset_active_layer)
         org_row.addWidget(self.reset_layer_btn)
-        basics_layout.addLayout(org_row)
-        workspace_layout.addWidget(basics_card)
+        workspace_layout.addLayout(org_row)
+        workspace_section = self._make_collapsible_section("Workspace", workspace_content, expanded=True)
 
-        preview_card = QFrame(self)
-        preview_card.setFrameShape(QFrame.StyledPanel)
-        preview_layout = QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(8, 8, 8, 8)
-        preview_layout.setSpacing(6)
-        preview_layout.addWidget(QLabel("Preview"))
-        compare_row = QHBoxLayout()
-        compare_row.setContentsMargins(0, 0, 0, 0)
-        compare_row.addWidget(QLabel("Compare"))
-        self.compare_combo = QComboBox()
-        self.compare_combo.addItems(["off", "before", "split", "side_by_side"])
-        self.compare_combo.currentTextChanged.connect(self._on_compare_mode_changed)
-        compare_row.addWidget(self.compare_combo, 1)
-        preview_layout.addLayout(compare_row)
+        # Global adjustments live in their own "Basic" section; the layer tabs hold
+        # only the portrait feature layers (subjects, background, face, ...).
+        self._tab_layers = [layer for layer in ALL_LAYERS if layer != "global"]
 
-        split_row = QHBoxLayout()
-        split_row.setContentsMargins(0, 0, 0, 0)
-        split_row.addWidget(QLabel("Split"))
-        self.split_slider = QSlider(Qt.Horizontal)
-        self.split_slider.setRange(0, 100)
-        self.split_slider.setValue(int(self._split_position * 100))
-        self.split_slider.valueChanged.connect(self._on_split_slider_changed)
-        split_row.addWidget(self.split_slider, 1)
-        preview_layout.addLayout(split_row)
+        global_content = QWidget(self)
+        global_layout = QVBoxLayout(global_content)
+        global_layout.setContentsMargins(8, 4, 8, 4)
+        global_layout.setSpacing(6)
+        global_layout.addWidget(self._build_slider_stack("global", ALL_LAYERS["global"], add_stretch=False))
+        global_section = self._make_collapsible_section("Global", global_content, expanded=True)
 
-        self.compare_hint_label = QLabel("Hold Space: original")
-        preview_layout.addWidget(self.compare_hint_label)
-
-        preview_layout.addWidget(QLabel("Histogram"))
-        self.histogram_widget = HistogramWidget(self)
-        preview_layout.addWidget(self.histogram_widget)
-
-        workspace_layout.addWidget(preview_card)
-        left_layout.addWidget(self._make_collapsible_section("Workspace", workspace_content, expanded=True))
+        layers_content = QWidget(self)
+        layers_layout = QVBoxLayout(layers_content)
+        layers_layout.setContentsMargins(0, 4, 0, 4)
+        layers_layout.setSpacing(6)
+        self.layer_tabs = QTabWidget(self)
+        self.layer_tabs.setDocumentMode(True)
+        for layer in self._tab_layers:
+            self.layer_tabs.addTab(self._build_layer_tab(layer, ALL_LAYERS[layer]), LAYER_NAMES[layer])
+        self.layer_tabs.currentChanged.connect(self._on_layer_changed)
+        layers_layout.addWidget(self.layer_tabs)
+        layers_section = self._make_collapsible_section("Layers", layers_content, expanded=True)
 
         mask_content = QWidget(self)
         mask_layout = QVBoxLayout(mask_content)
         mask_layout.setContentsMargins(8, 4, 8, 4)
         mask_layout.setSpacing(8)
         mask_row = QHBoxLayout()
-        self.mask_view_btn = QPushButton("Mask View")
+        self.mask_view_btn = QPushButton("Mask View", self)
         self.mask_view_btn.setCheckable(True)
         self.mask_view_btn.toggled.connect(self._on_mask_view_toggled)
         mask_row.addWidget(self.mask_view_btn)
-        self.mask_edit_btn = QPushButton("Edit Mask")
+        self.mask_edit_btn = QPushButton("Edit Mask", self)
         self.mask_edit_btn.setCheckable(True)
         self.mask_edit_btn.toggled.connect(self._on_mask_edit_toggled)
         mask_row.addWidget(self.mask_edit_btn)
         mask_layout.addLayout(mask_row)
 
         debug_row = QHBoxLayout()
-        debug_row.addWidget(QLabel("Debug"))
-        self.mask_debug_combo = QComboBox()
+        debug_row.addWidget(QLabel("View", self))
+        self.mask_debug_combo = QComboBox(self)
         self.mask_debug_combo.addItems(["tint", "heatmap", "isolated"])
         self.mask_debug_combo.currentTextChanged.connect(self._on_mask_debug_mode_changed)
         debug_row.addWidget(self.mask_debug_combo, 1)
-        self.guides_btn = QPushButton("Guides")
+        self.guides_btn = QPushButton("Guides", self)
         self.guides_btn.setCheckable(True)
         self.guides_btn.toggled.connect(self._on_guides_toggled)
         debug_row.addWidget(self.guides_btn)
         mask_layout.addLayout(debug_row)
 
-        self.mask_debug_label = QLabel("Mask: --")
+        self.mask_debug_label = QLabel("Mask: --", self)
+        self.mask_debug_label.setObjectName("MutedLabel")
         self.mask_debug_label.setWordWrap(True)
         mask_layout.addWidget(self.mask_debug_label)
 
-        mask_layout.addWidget(QLabel("Mask Settings"))
+        mask_layout.addWidget(QLabel("Mask Settings", self))
         for key, label, mn, mx in (
             ("strength", "Strength", 0, 200),
             ("feather", "Feather", 0, 40),
@@ -1490,70 +2086,70 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
         reset_settings_row = QHBoxLayout()
         reset_settings_row.addStretch(1)
-        self.reset_mask_settings_btn = QPushButton("Reset Settings")
+        self.reset_mask_settings_btn = QPushButton("Reset Settings", self)
         self.reset_mask_settings_btn.clicked.connect(self._reset_active_mask_settings)
         reset_settings_row.addWidget(self.reset_mask_settings_btn)
         mask_layout.addLayout(reset_settings_row)
 
         brush_row = QHBoxLayout()
-        brush_row.addWidget(QLabel("Brush"))
-        self.brush_slider = QSlider(Qt.Horizontal)
+        brush_row.addWidget(QLabel("Brush", self))
+        self.brush_slider = QSlider(Qt.Horizontal, self)
         self.brush_slider.setRange(2, 80)
         self.brush_slider.setValue(self._mask_brush_size)
         self.brush_slider.valueChanged.connect(self._on_brush_size_changed)
         brush_row.addWidget(self.brush_slider, 1)
-        self.brush_value_label = QLabel(str(self._mask_brush_size))
+        self.brush_value_label = QLabel(str(self._mask_brush_size), self)
         brush_row.addWidget(self.brush_value_label)
         mask_layout.addLayout(brush_row)
 
         hardness_row = QHBoxLayout()
-        hardness_row.addWidget(QLabel("Hardness"))
-        self.hardness_slider = QSlider(Qt.Horizontal)
+        hardness_row.addWidget(QLabel("Hardness", self))
+        self.hardness_slider = QSlider(Qt.Horizontal, self)
         self.hardness_slider.setRange(0, 100)
         self.hardness_slider.setValue(self._mask_brush_hardness)
         self.hardness_slider.valueChanged.connect(self._on_brush_hardness_changed)
         hardness_row.addWidget(self.hardness_slider, 1)
-        self.hardness_value_label = QLabel(f"{self._mask_brush_hardness}%")
+        self.hardness_value_label = QLabel(f"{self._mask_brush_hardness}%", self)
         hardness_row.addWidget(self.hardness_value_label)
         mask_layout.addLayout(hardness_row)
 
         mask_mode_row = QHBoxLayout()
-        mask_mode_row.addWidget(QLabel("Mode"))
-        self.mask_mode_combo = QComboBox()
+        mask_mode_row.addWidget(QLabel("Mode", self))
+        self.mask_mode_combo = QComboBox(self)
         self.mask_mode_combo.addItems(["paint", "erase"])
         self.mask_mode_combo.currentTextChanged.connect(self._on_mask_mode_changed)
         mask_mode_row.addWidget(self.mask_mode_combo, 1)
-        self.reset_mask_btn = QPushButton("Reset Mask")
+        self.reset_mask_btn = QPushButton("Reset Mask", self)
         self.reset_mask_btn.clicked.connect(self._reset_active_mask)
         mask_mode_row.addWidget(self.reset_mask_btn)
-        self.feather_mask_btn = QPushButton("Feather")
+        self.feather_mask_btn = QPushButton("Feather", self)
         self.feather_mask_btn.clicked.connect(self._feather_active_mask)
         mask_mode_row.addWidget(self.feather_mask_btn)
         mask_layout.addLayout(mask_mode_row)
 
         history_row = QHBoxLayout()
-        self.undo_mask_btn = QPushButton("Undo")
+        self.undo_mask_btn = QPushButton("Undo", self)
         self.undo_mask_btn.clicked.connect(self._undo_mask_edit)
         history_row.addWidget(self.undo_mask_btn)
-        self.redo_mask_btn = QPushButton("Redo")
+        self.redo_mask_btn = QPushButton("Redo", self)
         self.redo_mask_btn.clicked.connect(self._redo_mask_edit)
         history_row.addWidget(self.redo_mask_btn)
         mask_layout.addLayout(history_row)
-        left_layout.addWidget(self._make_collapsible_section("Mask Tools", mask_content, expanded=False))
+        masks_section = self._make_collapsible_section("Masks", mask_content, expanded=False)
 
         geometry_content = QWidget(self)
         geometry_layout = QVBoxLayout(geometry_content)
         geometry_layout.setContentsMargins(8, 4, 8, 4)
         geometry_layout.setSpacing(8)
 
-        self.crop_edit_btn = QPushButton("Crop")
+        self.crop_edit_btn = QPushButton("Crop", self)
         self.crop_edit_btn.setCheckable(True)
         self.crop_edit_btn.toggled.connect(self._on_crop_edit_toggled)
         geometry_layout.addWidget(self.crop_edit_btn)
 
         aspect_row = QHBoxLayout()
-        aspect_row.addWidget(QLabel("Aspect"))
-        self.aspect_combo = QComboBox()
+        aspect_row.addWidget(QLabel("Aspect", self))
+        self.aspect_combo = QComboBox(self)
         self._aspect_presets = [
             ("Free", None),
             ("Original", "original"),
@@ -1571,54 +2167,53 @@ class PortraitEnhancerQtWindow(QMainWindow):
         geometry_layout.addLayout(aspect_row)
 
         straighten_row = QHBoxLayout()
-        straighten_row.addWidget(QLabel("Straighten"))
-        self.straighten_slider = QSlider(Qt.Horizontal)
+        straighten_row.addWidget(QLabel("Straighten", self))
+        self.straighten_slider = QSlider(Qt.Horizontal, self)
         self.straighten_slider.setRange(-45, 45)
         self.straighten_slider.setValue(0)
         self.straighten_slider.valueChanged.connect(self._on_straighten_changed)
         straighten_row.addWidget(self.straighten_slider, 1)
-        self.straighten_value_label = QLabel("0°")
+        self.straighten_value_label = QLabel("0°", self)
         straighten_row.addWidget(self.straighten_value_label)
         geometry_layout.addLayout(straighten_row)
 
         flip_row = QHBoxLayout()
-        self.flip_h_btn = QPushButton("Flip H")
+        self.flip_h_btn = QPushButton("Flip H", self)
         self.flip_h_btn.clicked.connect(lambda: self._on_flip("flip_h"))
         flip_row.addWidget(self.flip_h_btn)
-        self.flip_v_btn = QPushButton("Flip V")
+        self.flip_v_btn = QPushButton("Flip V", self)
         self.flip_v_btn.clicked.connect(lambda: self._on_flip("flip_v"))
         flip_row.addWidget(self.flip_v_btn)
-        self.reset_framing_btn = QPushButton("Reset")
+        self.reset_framing_btn = QPushButton("Reset", self)
         self.reset_framing_btn.clicked.connect(self._reset_framing)
         flip_row.addWidget(self.reset_framing_btn)
         geometry_layout.addLayout(flip_row)
-
-        left_layout.addWidget(self._make_collapsible_section("Geometry", geometry_content, expanded=False))
+        geometry_section = self._make_collapsible_section("Geometry", geometry_content, expanded=False)
 
         wb_content = QWidget(self)
         wb_layout = QVBoxLayout(wb_content)
         wb_layout.setContentsMargins(8, 4, 8, 4)
         wb_layout.setSpacing(8)
-        self.wb_pick_btn = QPushButton("Pick Neutral")
+        self.wb_pick_btn = QPushButton("Pick Neutral", self)
         self.wb_pick_btn.setCheckable(True)
-        self.wb_pick_btn.setToolTip("Click a should-be-neutral area in the image to remove a color cast")
+        self.wb_pick_btn.setToolTip("Click a neutral area in the image")
         self.wb_pick_btn.toggled.connect(self._on_wb_pick_toggled)
         wb_layout.addWidget(self.wb_pick_btn)
         wb_auto_row = QHBoxLayout()
-        self.wb_gray_btn = QPushButton("Auto Gray")
+        self.wb_gray_btn = QPushButton("Auto Gray", self)
         self.wb_gray_btn.clicked.connect(self._wb_auto_gray_world)
         wb_auto_row.addWidget(self.wb_gray_btn)
-        self.wb_white_btn = QPushButton("Auto White")
+        self.wb_white_btn = QPushButton("Auto White", self)
         self.wb_white_btn.clicked.connect(self._wb_auto_white_patch)
         wb_auto_row.addWidget(self.wb_white_btn)
-        self.wb_reset_btn = QPushButton("Reset")
+        self.wb_reset_btn = QPushButton("Reset", self)
         self.wb_reset_btn.clicked.connect(self._reset_wb)
         wb_auto_row.addWidget(self.wb_reset_btn)
         wb_layout.addLayout(wb_auto_row)
 
         preset_row = QHBoxLayout()
-        preset_row.addWidget(QLabel("Preset"))
-        self.wb_preset_combo = QComboBox()
+        preset_row.addWidget(QLabel("Preset", self))
+        self.wb_preset_combo = QComboBox(self)
         self.wb_preset_combo.addItem("Custom")
         for name, _temp, _tint in wb_ops.PRESETS:
             self.wb_preset_combo.addItem(name)
@@ -1627,36 +2222,36 @@ class PortraitEnhancerQtWindow(QMainWindow):
         wb_layout.addLayout(preset_row)
 
         temp_row = QHBoxLayout()
-        temp_row.addWidget(QLabel("Temp"))
-        self.wb_temp_slider = QSlider(Qt.Horizontal)
+        temp_row.addWidget(QLabel("Temp", self))
+        self.wb_temp_slider = QSlider(Qt.Horizontal, self)
         self.wb_temp_slider.setRange(wb_ops.MIN_K, wb_ops.MAX_K)
         self.wb_temp_slider.setValue(wb_ops.NEUTRAL_K)
-        self.wb_temp_slider.setToolTip("Color temperature in Kelvin — right is warmer")
+        self.wb_temp_slider.setToolTip("Color temperature in Kelvin")
         self.wb_temp_slider.sliderPressed.connect(self._begin_document_change)
         self.wb_temp_slider.valueChanged.connect(self._on_wb_temp_changed)
         self.wb_temp_slider.sliderReleased.connect(self._push_document_history)
         temp_row.addWidget(self.wb_temp_slider, 1)
-        self.wb_temp_value_label = QLabel(f"{wb_ops.NEUTRAL_K}K")
+        self.wb_temp_value_label = QLabel(f"{wb_ops.NEUTRAL_K}K", self)
         temp_row.addWidget(self.wb_temp_value_label)
         wb_layout.addLayout(temp_row)
 
         tint_row = QHBoxLayout()
-        tint_row.addWidget(QLabel("Tint"))
-        self.wb_tint_slider = QSlider(Qt.Horizontal)
+        tint_row.addWidget(QLabel("Tint", self))
+        self.wb_tint_slider = QSlider(Qt.Horizontal, self)
         self.wb_tint_slider.setRange(wb_ops.TINT_MIN, wb_ops.TINT_MAX)
         self.wb_tint_slider.setValue(0)
-        self.wb_tint_slider.setToolTip("Magenta (right) / green (left)")
         self.wb_tint_slider.sliderPressed.connect(self._begin_document_change)
         self.wb_tint_slider.valueChanged.connect(self._on_wb_tint_changed)
         self.wb_tint_slider.sliderReleased.connect(self._push_document_history)
         tint_row.addWidget(self.wb_tint_slider, 1)
-        self.wb_tint_value_label = QLabel("0")
+        self.wb_tint_value_label = QLabel("0", self)
         tint_row.addWidget(self.wb_tint_value_label)
         wb_layout.addLayout(tint_row)
 
-        self.wb_status_label = QLabel("White balance: neutral")
+        self.wb_status_label = QLabel("White balance: neutral", self)
+        self.wb_status_label.setObjectName("MutedLabel")
         wb_layout.addWidget(self.wb_status_label)
-        left_layout.addWidget(self._make_collapsible_section("White Balance", wb_content, expanded=False))
+        wb_section = self._make_collapsible_section("White Balance", wb_content, expanded=False)
 
         curve_content = QWidget(self)
         curve_layout = QVBoxLayout(curve_content)
@@ -1669,19 +2264,19 @@ class PortraitEnhancerQtWindow(QMainWindow):
         curve_layout.addWidget(self.tone_curve_widget)
         curve_reset_row = QHBoxLayout()
         curve_reset_row.addStretch(1)
-        self.tone_curve_reset_btn = QPushButton("Reset Curve")
+        self.tone_curve_reset_btn = QPushButton("Reset Curve", self)
         self.tone_curve_reset_btn.clicked.connect(self._reset_tone_curve)
         curve_reset_row.addWidget(self.tone_curve_reset_btn)
         curve_layout.addLayout(curve_reset_row)
-        left_layout.addWidget(self._make_collapsible_section("Tone Curve", curve_content, expanded=False))
+        curve_section = self._make_collapsible_section("Tone Curve", curve_content, expanded=False)
 
         hsl_content = QWidget(self)
         hsl_layout = QVBoxLayout(hsl_content)
         hsl_layout.setContentsMargins(8, 4, 8, 4)
         hsl_layout.setSpacing(8)
         band_row = QHBoxLayout()
-        band_row.addWidget(QLabel("Color"))
-        self.hsl_band_combo = QComboBox()
+        band_row.addWidget(QLabel("Color", self))
+        self.hsl_band_combo = QComboBox(self)
         for name in cm_ops.BAND_NAMES:
             self.hsl_band_combo.addItem(name.capitalize())
         self.hsl_band_combo.currentIndexChanged.connect(self._on_hsl_band_changed)
@@ -1692,15 +2287,15 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.hsl_value_labels = {}
         for key, label in (("hue", "Hue"), ("sat", "Saturation"), ("lum", "Luminance")):
             row = QHBoxLayout()
-            row.addWidget(QLabel(label))
-            slider = QSlider(Qt.Horizontal)
+            row.addWidget(QLabel(label, self))
+            slider = QSlider(Qt.Horizontal, self)
             slider.setRange(-100, 100)
             slider.setValue(0)
             slider.sliderPressed.connect(self._begin_document_change)
             slider.valueChanged.connect(lambda value, k=key: self._on_hsl_slider_changed(k, value))
             slider.sliderReleased.connect(self._push_document_history)
             row.addWidget(slider, 1)
-            value_label = QLabel("0")
+            value_label = QLabel("0", self)
             row.addWidget(value_label)
             hsl_layout.addLayout(row)
             self.hsl_sliders[key] = slider
@@ -1708,132 +2303,51 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
         hsl_reset_row = QHBoxLayout()
         hsl_reset_row.addStretch(1)
-        self.hsl_reset_band_btn = QPushButton("Reset Color")
+        self.hsl_reset_band_btn = QPushButton("Reset Color", self)
         self.hsl_reset_band_btn.clicked.connect(self._reset_hsl_band)
         hsl_reset_row.addWidget(self.hsl_reset_band_btn)
-        self.hsl_reset_all_btn = QPushButton("Reset All")
+        self.hsl_reset_all_btn = QPushButton("Reset All", self)
         self.hsl_reset_all_btn.clicked.connect(self._reset_hsl_all)
         hsl_reset_row.addWidget(self.hsl_reset_all_btn)
         hsl_layout.addLayout(hsl_reset_row)
-        left_layout.addWidget(self._make_collapsible_section("Color Mixer (HSL)", hsl_content, expanded=False))
+        hsl_section = self._make_collapsible_section("Color Mixer (HSL)", hsl_content, expanded=False)
 
-        layers_content = QWidget(self)
-        layers_layout = QVBoxLayout(layers_content)
-        layers_layout.setContentsMargins(0, 4, 0, 4)
-        layers_layout.setSpacing(6)
-        self.layer_tabs = QTabWidget()
-        for layer, sliders in ALL_LAYERS.items():
-            self.layer_tabs.addTab(self._build_layer_tab(layer, sliders), LAYER_NAMES[layer])
-        self.layer_tabs.currentChanged.connect(self._on_layer_changed)
-        layers_layout.addWidget(self.layer_tabs)
-        left_layout.addWidget(self._make_collapsible_section("Layers", layers_content, expanded=True))
+        inspector_layout.addWidget(self._make_group_header("Portrait"))
+        inspector_layout.addWidget(workspace_section)
+        inspector_layout.addWidget(layers_section)
+        inspector_layout.addWidget(self._make_group_header("Masks"))
+        inspector_layout.addWidget(masks_section)
+        inspector_layout.addWidget(self._make_group_header("Basic"))
+        inspector_layout.addWidget(global_section)
+        inspector_layout.addWidget(geometry_section)
+        inspector_layout.addWidget(wb_section)
+        inspector_layout.addWidget(self._make_group_header("Color"))
+        inspector_layout.addWidget(curve_section)
+        inspector_layout.addWidget(hsl_section)
+        inspector_layout.addStretch(1)
 
-        preset_content = QWidget(self)
-        preset_layout = QVBoxLayout(preset_content)
-        preset_layout.setContentsMargins(8, 4, 8, 4)
-        preset_layout.setSpacing(8)
-        self.preset_search = QLineEdit()
-        self.preset_search.setPlaceholderText("Search presets")
-        self.preset_search.textChanged.connect(self._refresh_preset_browser)
-        self.preset_search.installEventFilter(self)
-        preset_layout.addWidget(self.preset_search)
+        inspector_scroll = QScrollArea(self)
+        inspector_scroll.setObjectName("InspectorScroll")
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setFrameShape(QFrame.NoFrame)
+        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        inspector_scroll.setWidget(inspector_panel)
+        inspector_scroll.viewport().setStyleSheet("background: #15171d;")
 
-        filter_row = QHBoxLayout()
-        filter_row.setContentsMargins(0, 0, 0, 0)
-        filter_row.addWidget(QLabel("Category"))
-        self.preset_category_combo = QComboBox()
-        self.preset_category_combo.addItem("all")
-        self.preset_category_combo.currentTextChanged.connect(self._on_preset_category_changed)
-        self.preset_category_combo.installEventFilter(self)
-        filter_row.addWidget(self.preset_category_combo, 1)
-        preset_layout.addLayout(filter_row)
+        splitter.addWidget(nav_panel)
+        splitter.addWidget(center_panel)
+        splitter.addWidget(inspector_scroll)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([300, 860, 420])
 
-        recent_label = QLabel("Recent Presets")
-        preset_layout.addWidget(recent_label)
-        self.recent_preset_list = QListWidget()
-        self.recent_preset_list.setMaximumHeight(92)
-        self.recent_preset_list.setMouseTracking(True)
-        self.recent_preset_list.installEventFilter(self)
-        self.recent_preset_list.itemDoubleClicked.connect(lambda _item: self._apply_selected_recent_preset())
-        self.recent_preset_list.currentRowChanged.connect(lambda _row: self._update_selected_preset_meta())
-        self.recent_preset_list.itemEntered.connect(lambda _item: self._update_selected_preset_meta())
-        preset_layout.addWidget(self.recent_preset_list)
-
-        self.preset_list = QListWidget()
-        self.preset_list.setMouseTracking(True)
-        self.preset_list.installEventFilter(self)
-        self.preset_list.setViewMode(QListView.IconMode)
-        self.preset_list.setResizeMode(QListView.Adjust)
-        self.preset_list.setMovement(QListView.Static)
-        self.preset_list.setIconSize(QSize(140, 96))
-        self.preset_list.setGridSize(QSize(164, 138))
-        self.preset_list.setWordWrap(True)
-        self.preset_list.setSpacing(8)
-        self.preset_list.itemDoubleClicked.connect(lambda _item: self._apply_selected_browser_preset())
-        self.preset_list.currentRowChanged.connect(lambda _row: self._update_selected_preset_meta())
-        self.preset_list.itemEntered.connect(lambda _item: self._update_selected_preset_meta())
-        preset_layout.addWidget(self.preset_list)
-
-        self.preset_preview_label = QLabel("No preset preview")
-        self.preset_preview_label.setAlignment(Qt.AlignCenter)
-        self.preset_preview_label.setMinimumHeight(120)
-        self.preset_preview_label.setStyleSheet("border: 1px solid #2a2a2f; background: #141418;")
-        preset_layout.addWidget(self.preset_preview_label)
-
-        self.preset_meta_label = QLabel("No preset selected")
-        self.preset_meta_label.setWordWrap(True)
-        preset_layout.addWidget(self.preset_meta_label)
-
-        preset_btn_row = QHBoxLayout()
-        self.apply_browser_preset_btn = QPushButton("Apply")
-        self.apply_browser_preset_btn.clicked.connect(self._apply_selected_browser_preset)
-        preset_btn_row.addWidget(self.apply_browser_preset_btn)
-        self.save_browser_preset_btn = QPushButton("Save Here")
-        self.save_browser_preset_btn.clicked.connect(self._save_preset_to_library)
-        preset_btn_row.addWidget(self.save_browser_preset_btn)
-        self.rename_browser_preset_btn = QPushButton("Rename")
-        self.rename_browser_preset_btn.clicked.connect(self._rename_selected_browser_preset)
-        preset_btn_row.addWidget(self.rename_browser_preset_btn)
-        self.delete_browser_preset_btn = QPushButton("Delete")
-        self.delete_browser_preset_btn.clicked.connect(self._delete_selected_browser_preset)
-        preset_btn_row.addWidget(self.delete_browser_preset_btn)
-        self.refresh_browser_preset_btn = QPushButton("Refresh")
-        self.refresh_browser_preset_btn.clicked.connect(self._refresh_preset_browser)
-        preset_btn_row.addWidget(self.refresh_browser_preset_btn)
-        preset_layout.addLayout(preset_btn_row)
-        left_layout.addWidget(self._make_collapsible_section("Preset Browser", preset_content, expanded=False))
-        left_layout.addStretch(1)
-
-        left_scroll = QScrollArea(self)
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QFrame.NoFrame)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        left_scroll.setWidget(left_panel)
-        root.addWidget(left_scroll, 0)
-
-        right_panel = QWidget(self)
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
-
-        self.info_label = QLabel("No image loaded")
-        self.info_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        right_layout.addWidget(self.info_label)
-        self.perf_label = QLabel("Perf: detect=-- ms | segment=-- ms | render=-- ms | preview=idle | expr=off | refine=off")
-        self.perf_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        right_layout.addWidget(self.perf_label)
-
-        self.image_label = ImagePreviewLabel()
-        self.image_label.set_compare_state(self._compare_mode, self._set_split_position)
-        self.image_label.set_edit_state(False, self._paint_active_mask_at, self._begin_mask_stroke)
-        self.image_label.set_crop_callbacks(
-            self._on_crop_changed, self._on_crop_committed, self._on_crop_drag_start
-        )
-        self.image_label.set_wb_pick_state(False, self._on_wb_picked)
-        right_layout.addWidget(self.image_label, 1)
-        root.addWidget(right_panel, 1)
+        self._apply_window_style()
         self._refresh_mask_controls()
         self._refresh_preset_browser()
+
+    def _build_ui(self):
+        self._build_editor_shell()
 
     def _build_mask_adjustment_row(self, key: str, label: str, mn: int, mx: int):
         row = QHBoxLayout()
@@ -1864,6 +2378,10 @@ class PortraitEnhancerQtWindow(QMainWindow):
     def _build_layer_tab(self, layer: str, sliders):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setWidget(self._build_slider_stack(layer, sliders))
+        return scroll
+
+    def _build_slider_stack(self, layer: str, sliders, add_stretch: bool = True):
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -1897,9 +2415,14 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self._slider_blocks.setdefault(layer, {})[key] = block
             layout.addWidget(block)
 
-        layout.addStretch(1)
-        scroll.setWidget(content)
-        return scroll
+        if add_stretch:
+            layout.addStretch(1)
+        return content
+
+    def _make_group_header(self, text: str) -> QLabel:
+        label = QLabel(text.upper(), self)
+        label.setObjectName("GroupHeader")
+        return label
 
     def _make_collapsible_section(self, title: str, content: QWidget, expanded: bool = True):
         expanded = bool(self._section_state.get(title, expanded))
@@ -2071,13 +2594,27 @@ class PortraitEnhancerQtWindow(QMainWindow):
         normalized["saved_at"] = str(normalized.get("saved_at") or "")
         return normalized
 
-    def _model_readiness_summary(self):
-        lines = []
-        root = Path(__file__).resolve().parents[2]
-        models_dir = root / "models"
-        lines.append(f"Workspace: {root}")
-        lines.append(f"Models Dir: {models_dir}")
-        lines.append("")
+    @staticmethod
+    def _humanize_reason(reason: str) -> str:
+        text = str(reason or "").strip()
+        low = text.lower()
+        if "onnxruntime" in low:
+            return "ONNX Runtime is not installed — advanced portrait masks use fallback mode."
+        if "mediapipe" in low:
+            return "MediaPipe is not installed — using fallback mode."
+        if "no module named" in low:
+            return "A required Python package is missing — using fallback mode."
+        if any(token in low for token in ("not found", "missing", "no model", "does not exist", "unavailable")):
+            return "Model file is not installed — feature uses fallback or is disabled."
+        return text or "Unavailable."
+
+    def _readiness_items(self):
+        """Structured per-component readiness for the System Check panel.
+
+        Returns (items, has_issues, models_dir). Each item is a dict with
+        name / status (ready|fallback|off) / message / detail (raw reason).
+        """
+        models_dir = Path(__file__).resolve().parents[2] / "models"
 
         parser = getattr(self.segmenter, "_model", None)
         detector = getattr(getattr(self.segmenter, "_heuristic", None), "_face_detector", None)
@@ -2086,55 +2623,42 @@ class PortraitEnhancerQtWindow(QMainWindow):
         refiner = get_face_refiner()
         refiner._ensure_session()
 
-        def exists_line(label, path):
-            if not path:
-                return f"{label}: missing"
-            return f"{label}: {'found' if Path(path).exists() else 'missing'} -> {path}"
+        def reason_of(obj):
+            return str(getattr(obj, "reason_unavailable", "") or "") if obj is not None else ""
 
-        parser_path = parser._resolve_model_path(getattr(parser, "_explicit_model_path", None)) if parser is not None else None
-        detector_path = detector._resolve_model_path(None) if detector is not None else None
-        subject_path = subject_segmenter._resolve_model_path() if subject_segmenter is not None else None
-        facial_hair_path = facial_hair_segmenter._resolve_model_path() if facial_hair_segmenter is not None else None
-        refiner_path = refiner._resolve_model_path() if refiner is not None else None
+        # name, component-reason, degraded-status when unavailable, ready description
+        specs = [
+            ("Face parsing", reason_of(parser), "fallback",
+             "Segments facial regions so Skin / Eyes / Lips / Hair edits stay local."),
+            ("Face detector", reason_of(detector), "fallback",
+             "Finds faces to target for selective edits."),
+            ("Subject selection", reason_of(subject_segmenter), "fallback",
+             "Separates subject from background for Subjects / Background layers."),
+            ("Facial hair", reason_of(facial_hair_segmenter), "off",
+             "Optional model that excludes facial hair from skin smoothing."),
+        ]
 
-        lines.append(f"Segmentation: {self.segmenter.backend_label}")
-        lines.append(f"Detector: {self.segmenter.detector_backend_label}")
-        lines.append(f"Subjects: {getattr(self.segmenter, 'subject_backend_label', 'subjects=heuristic')}")
-        lines.append(f"Facial Hair: {getattr(self.segmenter, 'facial_hair_backend_label', 'f_hair=fallback')}")
-        lines.append(f"Refiner: {refiner.backend_label if refiner.available else 'codeformer-unavailable'}")
-        lines.append("")
-        lines.append(exists_line("Face Parsing ONNX", parser_path))
-        lines.append(exists_line("YuNet Detector", detector_path))
-        lines.append(exists_line("Subject Segmenter", subject_path))
-        lines.append(exists_line("Facial Hair ONNX", facial_hair_path))
-        lines.append(exists_line("CodeFormer ONNX", refiner_path))
-        lines.append(exists_line("Landmarker Task", os.getenv("PORTRAIT_FACE_LANDMARKER_TASK") or (models_dir / "face_landmarker.task")))
-        lines.append("")
+        items = []
+        for name, reason, degraded, description in specs:
+            if reason:
+                items.append({"name": name, "status": degraded,
+                              "message": self._humanize_reason(reason), "detail": reason})
+            else:
+                items.append({"name": name, "status": "ready", "message": description, "detail": ""})
 
-        issues = []
-        parser_reason = getattr(parser, "reason_unavailable", "") if parser is not None else ""
-        if parser_reason:
-            issues.append(f"Segmentation: {parser_reason}")
-        subject_reason = getattr(subject_segmenter, "reason_unavailable", "") if subject_segmenter is not None else ""
-        if subject_reason:
-            issues.append(f"Subjects: {subject_reason}")
-        fh_reason = getattr(facial_hair_segmenter, "reason_unavailable", "") if facial_hair_segmenter is not None else ""
-        if fh_reason:
-            issues.append(f"Facial hair: {fh_reason}")
-        refiner_reason = getattr(refiner, "reason_unavailable", "") if refiner is not None else ""
-        if refiner_reason:
-            issues.append(f"Refiner: {refiner_reason}")
-        detector_reason = getattr(detector, "reason_unavailable", "") if detector is not None else ""
-        if detector_reason:
-            issues.append(f"Detector: {detector_reason}")
-
-        if issues:
-            lines.append("Issues:")
-            lines.extend(f"- {item}" for item in issues)
+        # Refiner exposes .available in addition to a reason string.
+        refiner_reason = reason_of(refiner)
+        refiner_available = bool(getattr(refiner, "available", False)) and not refiner_reason
+        if refiner_available:
+            items.append({"name": "Face refiner", "status": "ready",
+                          "message": "CodeFormer face restoration is available.", "detail": ""})
         else:
-            lines.append("Issues:")
-            lines.append("- none")
-        return "\n".join(lines), bool(issues)
+            items.append({"name": "Face refiner", "status": "off",
+                          "message": self._humanize_reason(refiner_reason or "Model file is not installed."),
+                          "detail": refiner_reason})
+
+        has_issues = any(item["status"] != "ready" for item in items)
+        return items, has_issues, models_dir
 
     def _browser_state_path(self):
         return self._preset_library_dir() / self.BROWSER_STATE_FILE
@@ -2230,10 +2754,10 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 "layer_options": {layer: dict(cfg) for layer, cfg in profile.get("layer_options", {}).items()},
                 "layer_order": list(profile.get("layer_order", list(MASK_ORDER))),
                 "mask_adjustments": self._copy_mask_adjustments(profile.get("mask_adjustments", {})),
-                "preview_masks": self._copy_masks(profile.get("preview_masks")),
-                "full_masks": self._copy_masks(profile.get("full_masks")),
-                "auto_preview_masks": self._copy_masks(profile.get("auto_preview_masks")),
-                "auto_full_masks": self._copy_masks(profile.get("auto_full_masks")),
+                "preview_masks": self._ref_masks(profile.get("preview_masks")),
+                "full_masks": self._ref_masks(profile.get("full_masks")),
+                "auto_preview_masks": self._ref_masks(profile.get("auto_preview_masks")),
+                "auto_full_masks": self._ref_masks(profile.get("auto_full_masks")),
                 "preview_guides": self._copy_guides(profile.get("preview_guides")),
                 "full_guides": self._copy_guides(profile.get("full_guides")),
             }
@@ -2468,10 +2992,10 @@ class PortraitEnhancerQtWindow(QMainWindow):
             "layer_options": {layer: dict(cfg) for layer, cfg in self._layer_options.items()},
             "layer_order": list(self._layer_order),
             "mask_adjustments": self._copy_mask_adjustments(self._mask_adjustments),
-            "preview_masks": self._copy_masks(self.preview_masks),
-            "full_masks": self._copy_masks(self.full_masks),
-            "auto_preview_masks": self._copy_masks(self._auto_preview_masks),
-            "auto_full_masks": self._copy_masks(self._auto_full_masks),
+            "preview_masks": self._ref_masks(self.preview_masks),
+            "full_masks": self._ref_masks(self.full_masks),
+            "auto_preview_masks": self._ref_masks(self._auto_preview_masks),
+            "auto_full_masks": self._ref_masks(self._auto_full_masks),
             "preview_guides": self._copy_guides(self.preview_guides),
             "full_guides": self._copy_guides(self.full_guides),
         }
@@ -2929,6 +3453,45 @@ class PortraitEnhancerQtWindow(QMainWindow):
             return None
         return paths[row]
 
+    def _params_differ_from_default(self, values, layer):
+        if not isinstance(values, dict):
+            return False
+        defaults = {key: default for key, _label, _mn, _mx, default in ALL_LAYERS.get(layer, [])}
+        for key, default in defaults.items():
+            if key in values and int(round(float(values[key]))) != int(default):
+                return True
+        return False
+
+    def _preset_scope_label(self, preset):
+        """Describe whether a preset affects Global edits, Portrait layers, or both."""
+        if not isinstance(preset, dict):
+            return "unknown"
+        global_active = self._params_differ_from_default(preset.get("global_params", {}), "global")
+        color_settings = preset.get("color_settings", {})
+        if isinstance(color_settings, dict) and color_settings:
+            if color_settings != self._default_color_settings():
+                global_active = True
+
+        portrait_active = False
+        selective = preset.get("selective_params", {})
+        if isinstance(selective, dict):
+            for layer in MASK_ORDER:
+                if self._params_differ_from_default(selective.get(layer, {}), layer):
+                    portrait_active = True
+                    break
+        if not portrait_active:
+            layer_options = preset.get("layer_options", {})
+            if isinstance(layer_options, dict) and any(layer_options.get(layer) for layer in MASK_ORDER):
+                portrait_active = True
+
+        if global_active and portrait_active:
+            return "Global + Portrait"
+        if global_active:
+            return "Global only"
+        if portrait_active:
+            return "Portrait only"
+        return "No adjustments"
+
     def _update_selected_preset_meta(self):
         if not hasattr(self, "preset_meta_label"):
             return
@@ -2943,6 +3506,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self.preset_meta_label.setText(
                 f"Name: {meta.get('name', Path(recent_path).stem)}\n"
                 f"Category: {meta.get('category', 'general')}\n"
+                f"Affects: {self._preset_scope_label(preset)}\n"
                 f"Tags: {', '.join(meta.get('tags', [])) or 'none'}\n"
                 f"Saved: {meta.get('saved_at') or 'unknown'}\n"
                 f"Path: {recent_path}"
@@ -2956,9 +3520,11 @@ class PortraitEnhancerQtWindow(QMainWindow):
         meta = entry["meta"]
         tags = ", ".join(meta.get("tags", [])) or "none"
         saved_at = meta.get("saved_at") or "unknown"
+        scope = self._preset_scope_label(entry.get("preset") or {})
         self.preset_meta_label.setText(
             f"Name: {meta.get('name', entry['path'].stem)}\n"
             f"Category: {meta.get('category', 'general')}\n"
+            f"Affects: {scope}\n"
             f"Tags: {tags}\n"
             f"Saved: {saved_at}\n"
             f"Path: {entry['path']}"
@@ -3107,24 +3673,41 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.statusBar().showMessage(f"Recipe applied -> {recipe.get('name', 'Recipe')}")
 
     def show_system_check(self):
-        report, _has_issues = self._model_readiness_summary()
-        ReadinessDialog(report, self, title="System Check").exec()
+        items, _has_issues, models_dir = self._readiness_items()
+        ReadinessDialog(
+            items, self, title="System Check",
+            recheck_callback=self._readiness_items, models_dir=models_dir,
+        ).exec()
 
     def _maybe_show_startup_readiness(self):
         state = self._browser_state_payload()
-        report, has_issues = self._model_readiness_summary()
+        items, has_issues, models_dir = self._readiness_items()
         if not has_issues and state.get("readiness_seen"):
             return
-        ReadinessDialog(report, self, title="Startup Readiness").exec()
+        ReadinessDialog(
+            items, self, title="Startup Readiness",
+            recheck_callback=self._readiness_items, models_dir=models_dir,
+        ).exec()
         state["readiness_seen"] = True
         self._write_browser_state(state)
 
     def _activate_layer(self, layer: str):
-        layers = list(ALL_LAYERS.keys())
-        if layer not in layers:
+        if layer == "global":
+            # Global adjustments are their own section now, not a layer tab.
+            self._active_layer = "global"
+            self._set_section_expanded("Global", True)
+            self._refresh_mask_controls()
+            self._update_preview_label()
             return
+        if layer not in self._tab_layers:
+            return
+        self._active_layer = layer
         self._set_section_expanded("Layers", True)
-        self.layer_tabs.setCurrentIndex(layers.index(layer))
+        index = self._tab_layers.index(layer)
+        if self.layer_tabs.currentIndex() != index:
+            self.layer_tabs.setCurrentIndex(index)
+        self._refresh_mask_controls()
+        self._update_preview_label()
 
     def _on_essentials_only_toggled(self, checked: bool):
         if bool(checked) != self._essentials_only:
@@ -3157,6 +3740,12 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
     def _schedule_render(self):
         if self.preview_array is None:
+            return
+        if self._slider_drag_active > 0 and self._render_timer.isActive():
+            # During an active drag, let the already-running timer fire on its
+            # ~60ms cadence so the preview updates live. Restarting it on every
+            # valueChanged (as below) would coalesce them and starve updates until
+            # the drag pauses or is released, which reads as "not responding".
             return
         self._render_timer.start()
 
@@ -3417,7 +4006,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._schedule_render()
 
     def _on_layer_changed(self, index: int):
-        self._active_layer = list(ALL_LAYERS.keys())[max(0, index)]
+        self._active_layer = self._tab_layers[max(0, min(index, len(self._tab_layers) - 1))]
         self._refresh_mask_controls()
         self._update_preview_label()
 
@@ -3437,7 +4026,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 self.crop_edit_btn.setChecked(False)  # mutually exclusive edit modes
             if self._wb_pick_enabled and hasattr(self, "wb_pick_btn"):
                 self.wb_pick_btn.setChecked(False)
-            self._set_section_expanded("Mask Tools", True)
+            self._set_section_expanded("Masks", True)
         self._refresh_mask_controls()
         self._update_preview_label()
 
@@ -4006,6 +4595,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
     def _read_image_file(self, path: str):
         ext = Path(path).suffix.lower()
+        self._source_metadata = {}
         if ext in {".cr2", ".nef", ".arw", ".dng", ".raw"}:
             if not HAS_RAWPY:
                 raise RuntimeError("rawpy is not installed. Install base dependencies first.")
@@ -4014,6 +4604,18 @@ class PortraitEnhancerQtWindow(QMainWindow):
             return rgb16.astype(np.float32) / 65535.0
 
         pil = Image.open(path)
+        # Capture embeddable metadata before exif_transpose/convert drop it.
+        metadata = {}
+        exif_bytes = pil.info.get("exif")
+        if exif_bytes:
+            metadata["exif"] = exif_bytes
+        icc_profile = pil.info.get("icc_profile")
+        if icc_profile:
+            metadata["icc_profile"] = icc_profile
+        dpi = pil.info.get("dpi")
+        if dpi:
+            metadata["dpi"] = dpi
+        self._source_metadata = metadata
         pil = ImageOps.exif_transpose(pil).convert("RGB")
         return np.asarray(pil, dtype=np.float32) / 255.0
 
@@ -4501,6 +5103,17 @@ class PortraitEnhancerQtWindow(QMainWindow):
             return None
         return {key: value.copy() for key, value in masks.items()}
 
+    def _ref_masks(self, masks):
+        # Shallow snapshot: a new dict that shares the mask array references. This
+        # is safe because mask arrays are only ever *replaced* in the live state
+        # (never mutated in place), so a stored reference keeps its historical
+        # value. Any path that needs independent live arrays (_restore_face_profile)
+        # deep-copies via _copy_masks. Avoids copying full-resolution mask pixels on
+        # the interaction hot path (document-history capture on every sliderPressed).
+        if masks is None:
+            return None
+        return dict(masks)
+
     def _copy_params(self, params):
         return {layer: dict(values) for layer, values in (params or {}).items()}
 
@@ -4704,14 +5317,35 @@ class PortraitEnhancerQtWindow(QMainWindow):
         if self.full_array is None:
             QMessageBox.information(self, "Export", "Open an image first.")
             return
-        out_path, _ = QFileDialog.getSaveFileName(
+        src = Path(self.file_path) if self.file_path else None
+        default_dir = str(src.parent) if src else os.path.expanduser("~")
+        stem = src.stem if src else "portrait"
+        h, w = self.full_array.shape[:2]
+        dialog = ExportDialog(
             self,
-            "Export Image",
-            str(Path(self.file_path).with_name(f"{Path(self.file_path).stem}_qt_export.jpg")),
-            "JPEG (*.jpg *.jpeg);;PNG (*.png);;TIFF (*.tif *.tiff)",
+            output_dir=default_dir,
+            stem=stem,
+            output_format=self._last_export_format,
+            quality=self._last_export_quality,
+            has_metadata=bool(self._source_metadata),
+            source_w=w,
+            source_h=h,
         )
-        if not out_path:
+        if dialog.exec() != QDialog.Accepted:
             return
+        opts = dialog.options()
+        if not opts["dest_dir"]:
+            QMessageBox.warning(self, "Export", "Choose a destination folder.")
+            return
+        out_path = opts["out_path"]
+        if os.path.exists(out_path):
+            confirm = QMessageBox.question(
+                self, "Export", f"{os.path.basename(out_path)} already exists. Overwrite?"
+            )
+            if confirm != QMessageBox.Yes:
+                return
+        self._last_export_format = opts["format"]
+        self._last_export_quality = opts["quality"]
         try:
             result = process_all_layers(
                 self.full_array,
@@ -4724,10 +5358,41 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 runtime_settings=self._runtime_settings,
             )
             result = apply_framing(result, self._framing)
-            result.save(out_path)
-            self.statusBar().showMessage(f"Exported {out_path}")
+            if opts["resize_long_edge"]:
+                result = self._resize_long_edge(result, opts["resize_long_edge"])
+            save_kwargs = self._export_metadata_kwargs(opts) if opts["keep_metadata"] else {}
+            if opts["format"] == "jpeg":
+                result.save(out_path, "JPEG", quality=opts["quality"], subsampling=0, **save_kwargs)
+            elif opts["format"] == "png":
+                result.save(out_path, "PNG", **save_kwargs)
+            else:
+                result.save(out_path, "TIFF", **save_kwargs)
+            self.statusBar().showMessage(f"Exported -> {out_path}")
+            QMessageBox.information(self, "Exported", f"Saved:\n{out_path}")
         except Exception as ex:
             QMessageBox.critical(self, "Export Error", str(ex))
+
+    def _resize_long_edge(self, image, limit: int):
+        w, h = image.size
+        longest = max(w, h)
+        if longest <= int(limit):
+            return image
+        scale = int(limit) / float(longest)
+        new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+        return image.resize(new_size, Image.LANCZOS)
+
+    def _export_metadata_kwargs(self, opts):
+        """Re-embed EXIF/ICC/DPI from the source when the format supports it."""
+        meta = self._source_metadata or {}
+        kwargs = {}
+        ext = opts["ext"].lower()
+        if meta.get("exif") and ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
+            kwargs["exif"] = meta["exif"]
+        if meta.get("icc_profile"):
+            kwargs["icc_profile"] = meta["icc_profile"]
+        if meta.get("dpi"):
+            kwargs["dpi"] = meta["dpi"]
+        return kwargs
 
     def reset_all(self):
         self._begin_document_change()
