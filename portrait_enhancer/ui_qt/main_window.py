@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QListView,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QInputDialog,
     QPushButton,
@@ -1550,16 +1552,17 @@ class PreviewRenderTask(QRunnable):
 
 
 class ImportDialog(QDialog):
-    """Dialog to import images from a folder."""
+    """Dialog to import images from a folder into a named collection."""
 
-    def __init__(self, parent=None, supported_exts=None):
+    def __init__(self, parent=None, supported_exts=None, existing_collections=None):
         super().__init__(parent)
         self.setWindowTitle("Import Images")
         self.setModal(True)
-        self.resize(600, 200)
+        self.resize(600, 240)
         self._supported_exts = supported_exts or {".cr2", ".nef", ".arw", ".dng", ".raw", ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
         self._selected_folder = None
         self._image_count = 0
+        self._collection_name_edited = False
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -1583,6 +1586,20 @@ class ImportDialog(QDialog):
         self.count_label.setObjectName("MutedLabel")
         layout.addWidget(self.count_label)
 
+        collection_layout = QHBoxLayout()
+        collection_layout.addWidget(QLabel("Collection:", self))
+        self.collection_combo = QComboBox(self)
+        self.collection_combo.setEditable(True)
+        self.collection_combo.addItems(sorted(existing_collections or [], key=str.lower))
+        self.collection_combo.setCurrentText("")
+        self.collection_combo.editTextChanged.connect(self._on_collection_name_edited)
+        collection_layout.addWidget(self.collection_combo, 1)
+        layout.addLayout(collection_layout)
+
+        hint = QLabel("Pick an existing collection to merge into it, or type a new name.", self)
+        hint.setObjectName("MutedLabel")
+        layout.addWidget(hint)
+
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1591,6 +1608,9 @@ class ImportDialog(QDialog):
         self.ok_btn = buttons.button(QDialogButtonBox.Ok)
         self.ok_btn.setEnabled(False)
         layout.addWidget(buttons)
+
+    def _on_collection_name_edited(self, _text):
+        self._collection_name_edited = True
 
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder to Import")
@@ -1610,17 +1630,106 @@ class ImportDialog(QDialog):
             self.count_label.setText(f"Error: {str(e)}")
             self.ok_btn.setEnabled(False)
 
+        if not self._collection_name_edited:
+            self.collection_combo.setCurrentText(Path(folder).name)
+            self._collection_name_edited = False
+
     def selected_folder(self):
         return self._selected_folder
 
     def image_count(self):
         return self._image_count
 
+    def collection_name(self):
+        return self.collection_combo.currentText().strip()
+
+
+class CollectionExportDialog(QDialog):
+    """Dialog to batch export every image in a collection using a preset."""
+
+    def __init__(self, parent=None, preset_path="", output_dir="", suffix="_enhanced", output_format="jpeg", skip_completed=True, image_count=0):
+        super().__init__(parent)
+        self.setWindowTitle("Export Collection")
+        self.setModal(True)
+        self.resize(640, 260)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        info = QLabel(f"Export {image_count} image(s) from this collection using a preset.", self)
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        self.preset_edit = QLineEdit(preset_path)
+        form.addRow("Preset", self._path_row(self.preset_edit, self._browse_preset))
+
+        self.output_edit = QLineEdit(output_dir)
+        form.addRow("Output Folder", self._path_row(self.output_edit, self._browse_output_dir))
+
+        self.suffix_edit = QLineEdit(suffix)
+        form.addRow("Suffix", self.suffix_edit)
+
+        self.format_combo = QComboBox(self)
+        self.format_combo.addItems(["jpeg", "png", "tiff"])
+        self.format_combo.setCurrentText(output_format)
+        form.addRow("Output Format", self.format_combo)
+
+        self.skip_completed_check = QCheckBox("Skip already completed files from prior runs", self)
+        self.skip_completed_check.setChecked(bool(skip_completed))
+        layout.addWidget(self.skip_completed_check)
+
+        layout.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _path_row(self, line_edit, browse_slot):
+        row = QWidget(self)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.addWidget(line_edit, 1)
+        browse_btn = QPushButton("Browse...", self)
+        browse_btn.setMaximumWidth(100)
+        browse_btn.clicked.connect(browse_slot)
+        row_layout.addWidget(browse_btn)
+        return row
+
+    def _browse_preset(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Preset", "", "Portrait Preset (*.pepreset *.json)")
+        if path:
+            self.preset_edit.setText(path)
+
+    def _browse_output_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if path:
+            self.output_edit.setText(path)
+
+    def preset_path(self):
+        return self.preset_edit.text().strip()
+
+    def output_dir(self):
+        return self.output_edit.text().strip()
+
+    def suffix(self):
+        return self.suffix_edit.text()
+
+    def output_format(self):
+        return self.format_combo.currentText()
+
+    def skip_completed(self):
+        return self.skip_completed_check.isChecked()
+
 
 class FilmstripThumbnail(QFrame):
     """Clickable thumbnail widget for the image filmstrip."""
 
     clicked = Signal(str)  # emits the image path
+    remove_requested = Signal(str)  # emits the image path
 
     def __init__(self, path: str, parent=None):
         super().__init__(parent)
@@ -1634,6 +1743,8 @@ class FilmstripThumbnail(QFrame):
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedWidth(80)
         self.setFixedHeight(98)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -1685,6 +1796,13 @@ class FilmstripThumbnail(QFrame):
             event.accept()
         else:
             super().mousePressEvent(event)
+
+    def _show_context_menu(self, pos):
+        menu = QMenu(self)
+        remove_action = menu.addAction("Remove from Collection")
+        action = menu.exec(self.mapToGlobal(pos))
+        if action == remove_action:
+            self.remove_requested.emit(self.path)
 
 
 class PortraitEnhancerQtWindow(QMainWindow):
@@ -1777,6 +1895,8 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._focus_mode = False
         self._focus_restore = None
         self._settings_clipboard = None
+        self._collections = {}
+        self._active_collection = None
         self._imported_images = []
         self._import_queue = []
         self._import_worker_timer = QTimer(self)
@@ -1800,6 +1920,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
         self._build_ui()
         self._load_browser_state()
+        self._load_collections_state()
         self._apply_essentials_filter()
         self._refresh_recent_presets()
         self._clear_document_history()
@@ -2300,9 +2421,41 @@ class PortraitEnhancerQtWindow(QMainWindow):
         filmstrip_layout.setContentsMargins(8, 6, 8, 6)
         filmstrip_layout.setSpacing(0)
 
-        filmstrip_label = QLabel("Images in folder", self)
-        filmstrip_label.setObjectName("MutedLabel")
-        filmstrip_layout.addWidget(filmstrip_label)
+        filmstrip_header_row = QHBoxLayout()
+        filmstrip_header_row.setContentsMargins(0, 0, 0, 4)
+        filmstrip_header_row.setSpacing(8)
+        filmstrip_caption = QLabel("Collection", self)
+        filmstrip_caption.setObjectName("MutedLabel")
+        filmstrip_header_row.addWidget(filmstrip_caption)
+        self.collection_combo = QComboBox(self)
+        self.collection_combo.setMinimumWidth(220)
+        self.collection_combo.setToolTip("Select an imported collection to show in the filmstrip")
+        self.collection_combo.currentIndexChanged.connect(self._on_collection_combo_changed)
+        filmstrip_header_row.addWidget(self.collection_combo)
+        self.rename_collection_btn = QPushButton("Rename", self)
+        self.rename_collection_btn.setMaximumWidth(70)
+        self.rename_collection_btn.setToolTip("Rename the selected collection")
+        self.rename_collection_btn.setEnabled(False)
+        self.rename_collection_btn.clicked.connect(self._rename_active_collection)
+        filmstrip_header_row.addWidget(self.rename_collection_btn)
+        self.delete_collection_btn = QPushButton("Delete", self)
+        self.delete_collection_btn.setMaximumWidth(70)
+        self.delete_collection_btn.setToolTip("Remove this collection from the app (image files are not deleted)")
+        self.delete_collection_btn.setEnabled(False)
+        self.delete_collection_btn.clicked.connect(self._delete_active_collection)
+        filmstrip_header_row.addWidget(self.delete_collection_btn)
+        filmstrip_header_row.addStretch(1)
+        self.apply_settings_collection_btn = QPushButton("Apply Settings", self)
+        self.apply_settings_collection_btn.setToolTip("Apply the copied settings to every image in this collection (non-destructive)")
+        self.apply_settings_collection_btn.setEnabled(False)
+        self.apply_settings_collection_btn.clicked.connect(self._apply_settings_to_collection)
+        filmstrip_header_row.addWidget(self.apply_settings_collection_btn)
+        self.export_collection_btn = QPushButton("Export...", self)
+        self.export_collection_btn.setToolTip("Batch export every image in this collection using a preset")
+        self.export_collection_btn.setEnabled(False)
+        self.export_collection_btn.clicked.connect(self._export_collection)
+        filmstrip_header_row.addWidget(self.export_collection_btn)
+        filmstrip_layout.addLayout(filmstrip_header_row)
 
         filmstrip_scroll = QScrollArea(self)
         filmstrip_scroll.setWidgetResizable(True)
@@ -2319,6 +2472,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
 
         self._filmstrip_items = {}  # path -> thumbnail widget
         self._filmstrip_images = []  # sorted list of image paths
+        self._filmstrip_placeholder = None
         self._current_filmstrip_path = None
         center_layout.addWidget(filmstrip_frame, 0)
 
@@ -3066,6 +3220,274 @@ class PortraitEnhancerQtWindow(QMainWindow):
         )
         self._write_browser_state(payload)
 
+    def _collections_dir(self):
+        path = Path(os.getcwd()) / "collections"
+        path.mkdir(exist_ok=True)
+        return path
+
+    def _collections_state_path(self):
+        return self._collections_dir() / "collections.json"
+
+    def _thumbnail_cache_dir(self):
+        path = self._collections_dir() / "thumbnails"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _thumbnail_cache_path(self, img_path: str):
+        try:
+            stat = os.stat(img_path)
+            sig = f"{img_path}:{stat.st_size}:{int(stat.st_mtime)}"
+        except OSError:
+            sig = img_path
+        key = hashlib.sha1(sig.encode("utf-8")).hexdigest()
+        return self._thumbnail_cache_dir() / f"{key}.jpg"
+
+    def _load_collections_state(self):
+        path = self._collections_state_path()
+        if path.is_file():
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except Exception:
+                payload = {}
+            collections = payload.get("collections", {})
+            if isinstance(collections, dict):
+                cleaned = {}
+                for name, data in collections.items():
+                    if not isinstance(data, dict):
+                        continue
+                    images = [p for p in data.get("images", []) if isinstance(p, str)]
+                    overrides = data.get("image_overrides", {})
+                    cleaned[str(name)] = {
+                        "images": images,
+                        "created_at": data.get("created_at", ""),
+                        "source_folder": data.get("source_folder", ""),
+                        "image_overrides": overrides if isinstance(overrides, dict) else {},
+                    }
+                self._collections = cleaned
+            active = payload.get("active_collection")
+            if active and active in self._collections:
+                self._active_collection = active
+        self._refresh_collection_combo()
+        self._apply_active_collection()
+
+    def _save_collections_state(self):
+        payload = {
+            "active_collection": self._active_collection,
+            "collections": self._collections,
+        }
+        try:
+            with open(self._collections_state_path(), "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except Exception:
+            return
+
+    def _refresh_collection_combo(self):
+        if not hasattr(self, "collection_combo"):
+            return
+        self.collection_combo.blockSignals(True)
+        self.collection_combo.clear()
+        self.collection_combo.addItem("No collection", None)
+        for name in sorted(self._collections.keys(), key=str.lower):
+            count = len(self._collections[name].get("images", []))
+            self.collection_combo.addItem(f"{name} ({count})", name)
+        if self._active_collection and self._active_collection in self._collections:
+            idx = self.collection_combo.findData(self._active_collection)
+            if idx >= 0:
+                self.collection_combo.setCurrentIndex(idx)
+        else:
+            self.collection_combo.setCurrentIndex(0)
+        self.collection_combo.blockSignals(False)
+        has_active = bool(self._active_collection and self._active_collection in self._collections)
+        if hasattr(self, "delete_collection_btn"):
+            self.delete_collection_btn.setEnabled(has_active)
+        if hasattr(self, "rename_collection_btn"):
+            self.rename_collection_btn.setEnabled(has_active)
+        if hasattr(self, "apply_settings_collection_btn"):
+            self.apply_settings_collection_btn.setEnabled(has_active)
+        if hasattr(self, "export_collection_btn"):
+            self.export_collection_btn.setEnabled(has_active)
+
+    def _on_collection_combo_changed(self, index: int):
+        name = self.collection_combo.itemData(index)
+        self._active_collection = name
+        self._save_collections_state()
+        self._apply_active_collection()
+        has_active = bool(name)
+        if hasattr(self, "delete_collection_btn"):
+            self.delete_collection_btn.setEnabled(has_active)
+        if hasattr(self, "rename_collection_btn"):
+            self.rename_collection_btn.setEnabled(has_active)
+        if hasattr(self, "apply_settings_collection_btn"):
+            self.apply_settings_collection_btn.setEnabled(has_active)
+        if hasattr(self, "export_collection_btn"):
+            self.export_collection_btn.setEnabled(has_active)
+
+    def _apply_active_collection(self):
+        if self._active_collection and self._active_collection in self._collections:
+            self._imported_images = list(self._collections[self._active_collection].get("images", []))
+        else:
+            self._imported_images = []
+        self._populate_filmstrip()
+
+    def _rename_active_collection(self):
+        old_name = self._active_collection
+        if not old_name or old_name not in self._collections:
+            return
+        new_name, ok = QInputDialog.getText(self, "Rename Collection", "New name:", text=old_name)
+        new_name = new_name.strip()
+        if not ok or not new_name or new_name == old_name:
+            return
+        if new_name in self._collections:
+            QMessageBox.warning(self, "Rename Collection", f"A collection named \"{new_name}\" already exists.")
+            return
+        self._collections[new_name] = self._collections.pop(old_name)
+        self._active_collection = new_name
+        self._save_collections_state()
+        self._refresh_collection_combo()
+        self.statusBar().showMessage(f"Renamed collection to \"{new_name}\"")
+
+    def _delete_active_collection(self):
+        name = self._active_collection
+        if not name or name not in self._collections:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete Collection",
+            f"Remove the collection \"{name}\"? This only removes it from the app; image files on disk are not affected.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._collections.pop(name, None)
+        self._active_collection = None
+        self._save_collections_state()
+        self._refresh_collection_combo()
+        self._apply_active_collection()
+        self.statusBar().showMessage(f"Deleted collection \"{name}\"")
+
+    def _get_collection_image_override(self, path: str):
+        """Return the saved non-destructive settings override for an image, if any."""
+        if not self._active_collection:
+            return None
+        collection = self._collections.get(self._active_collection)
+        if not collection:
+            return None
+        return collection.get("image_overrides", {}).get(path)
+
+    def _apply_settings_to_collection(self):
+        """Apply the copied settings to every image in the active collection (non-destructive)."""
+        if not self._active_collection or self._active_collection not in self._collections:
+            QMessageBox.information(self, "No Collection", "Select a collection first.")
+            return
+        collection = self._collections[self._active_collection]
+        images = collection.get("images", [])
+        if not images:
+            QMessageBox.information(self, "Empty Collection", "This collection has no images.")
+            return
+        if self._settings_clipboard is None:
+            if self.preview_array is None:
+                QMessageBox.information(
+                    self,
+                    "No Settings",
+                    "Open an image and use Copy Settings (Ctrl+Alt+C) first, then apply to a collection.",
+                )
+                return
+            self._copy_settings()
+        if self._settings_clipboard is None:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Apply Settings to Collection",
+            f"Apply the copied settings to all {len(images)} image(s) in \"{self._active_collection}\"?\n\n"
+            "This updates each image's saved settings non-destructively — opening any image in this "
+            "collection will show these settings applied. No files are exported.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        overrides = collection.setdefault("image_overrides", {})
+        for path in images:
+            overrides[path] = copy.deepcopy(self._settings_clipboard)
+        self._save_collections_state()
+        if self.file_path in images:
+            self._begin_document_change()
+            self._apply_settings_payload(self._settings_clipboard)
+            self._schedule_render()
+            self._push_document_history()
+        self.statusBar().showMessage(
+            f"Applied settings to {len(images)} image(s) in \"{self._active_collection}\" (non-destructive)"
+        )
+
+    def _export_collection(self):
+        """Batch export every image in the active collection using a chosen preset."""
+        if not self._active_collection or self._active_collection not in self._collections:
+            QMessageBox.information(self, "No Collection", "Select a collection first.")
+            return
+        collection = self._collections[self._active_collection]
+        images = collection.get("images", [])
+        if not images:
+            QMessageBox.information(self, "Empty Collection", "This collection has no images.")
+            return
+
+        last_options = self._last_batch_options()
+        dialog = CollectionExportDialog(
+            self,
+            preset_path=last_options.get("preset_path", ""),
+            output_dir=last_options.get("output_dir", ""),
+            suffix=last_options.get("suffix", "_enhanced"),
+            output_format=last_options.get("format", "jpeg"),
+            skip_completed=bool(last_options.get("skip_completed", True)),
+            image_count=len(images),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        preset_path = dialog.preset_path()
+        output_dir = dialog.output_dir()
+        suffix = dialog.suffix()
+        output_format = dialog.output_format()
+        skip_completed = dialog.skip_completed()
+
+        if not preset_path or not os.path.isfile(preset_path):
+            QMessageBox.warning(self, "Export Collection", "Select a valid preset file.")
+            return
+        if not output_dir or not os.path.isdir(output_dir):
+            QMessageBox.warning(self, "Export Collection", "Select a valid output folder.")
+            return
+        if output_format not in self.BATCH_OUTPUT_FORMATS:
+            QMessageBox.warning(self, "Export Collection", "Select a valid output format.")
+            return
+
+        try:
+            with open(preset_path, "r", encoding="utf-8") as fh:
+                json.load(fh)
+        except Exception as ex:
+            QMessageBox.critical(self, "Preset Load Error", str(ex))
+            return
+
+        job_path = self._write_batch_job_file(
+            {
+                "mode": "collection_export",
+                "preset_path": os.path.abspath(preset_path),
+                "output_dir": os.path.abspath(output_dir),
+                "suffix": suffix,
+                "output_format": output_format,
+                "skip_completed": skip_completed,
+                "runtime_settings": dict(self._runtime_settings),
+                "source_paths": [os.path.abspath(p) for p in images],
+            },
+            output_dir,
+        )
+        runner_log = self._launch_background_batch_job(job_path, output_dir)
+        QMessageBox.information(
+            self,
+            "Export Started",
+            f"Background export of \"{self._active_collection}\" started ({len(images)} image(s)).\n"
+            f"You can close the app.\n\nJob: {job_path}\nLog: {os.path.join(output_dir, 'batch_export_log.jsonl')}\nRunner stdout: {runner_log}",
+        )
+        self.statusBar().showMessage(f"Background export of \"{self._active_collection}\" started")
+
     def _remember_recent_preset(self, path: str):
         normalized = str(Path(path).resolve())
         recent = [normalized]
@@ -3205,18 +3627,12 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self.settings_indicator.setText("copied ✓")
         self.statusBar().showMessage("Settings copied ✓")
 
-    def _paste_settings(self):
-        """Paste copied settings to the current image."""
-        if self._settings_clipboard is None:
-            self.statusBar().showMessage("No settings in clipboard")
+    def _apply_settings_payload(self, payload: dict):
+        """Apply a settings-clipboard-shaped payload (global/color/layers/selective) to the current image."""
+        if not payload:
             return
-        if self.preview_array is None:
-            self.statusBar().showMessage("No image loaded — nothing to paste to")
-            return
-        self._begin_document_change()
-        clipboard = self._settings_clipboard
         # Apply global params.
-        global_params = clipboard.get("global_params", {})
+        global_params = payload.get("global_params", {})
         for key, value in global_params.items():
             if "global" in self._sliders and key in self._sliders["global"]:
                 slider = self._sliders["global"][key]
@@ -3227,7 +3643,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
                     label = self._slider_value_labels["global"][key]
                     label.setText(f"{int(value):+d}" if value else "0")
         # Apply color settings.
-        color_settings = clipboard.get("color_settings", {})
+        color_settings = payload.get("color_settings", {})
         if isinstance(color_settings, dict):
             merged = self._default_color_settings()
             merged.update(color_settings)
@@ -3236,13 +3652,13 @@ class PortraitEnhancerQtWindow(QMainWindow):
         if hasattr(self, '_sync_tone_curve_controls'):
             self._sync_tone_curve_controls()
         # Apply layer options and order.
-        layer_options = clipboard.get("layer_options", {})
+        layer_options = payload.get("layer_options", {})
         if isinstance(layer_options, dict):
             for layer in MASK_ORDER:
                 cfg = dict(self._layer_options.get(layer, {}))
                 cfg.update(layer_options.get(layer, {}))
                 self._layer_options[layer] = cfg
-        layer_order = [layer for layer in clipboard.get("layer_order", []) if layer in MASK_ORDER]
+        layer_order = [layer for layer in payload.get("layer_order", []) if layer in MASK_ORDER]
         for layer in MASK_ORDER:
             if layer not in layer_order:
                 layer_order.append(layer)
@@ -3251,7 +3667,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         if hasattr(self, '_sync_mask_adjustment_controls'):
             self._sync_mask_adjustment_controls()
         # Apply selective params to detected faces.
-        selective_by_face = clipboard.get("selective_by_face", [])
+        selective_by_face = payload.get("selective_by_face", [])
         for face_idx, profile_data in enumerate(selective_by_face):
             if face_idx >= len(self._detected_faces):
                 break
@@ -3275,6 +3691,17 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 )
         # Reload the active face profile to update the UI.
         self._restore_face_profile(self._active_face_index)
+
+    def _paste_settings(self):
+        """Paste copied settings to the current image."""
+        if self._settings_clipboard is None:
+            self.statusBar().showMessage("No settings in clipboard")
+            return
+        if self.preview_array is None:
+            self.statusBar().showMessage("No image loaded — nothing to paste to")
+            return
+        self._begin_document_change()
+        self._apply_settings_payload(self._settings_clipboard)
         self._schedule_render()
         self._push_document_history()
         if hasattr(self, 'settings_indicator'):
@@ -5069,7 +5496,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.file_path = path
         self.statusBar().showMessage(f"Loading {os.path.basename(path)} ...")
         self.image_label.reset_view()
-        self._populate_filmstrip()
+        self._update_filmstrip_active()
         full = self._read_image_file(path)
         preview, scale = self._build_preview_proxy(full)
         interactive_preview, interactive_ratio = self._build_interactive_preview_proxy(preview)
@@ -5095,16 +5522,33 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self._sync_tone_curve_controls()
             self._sync_hsl_controls()
             self._run_segmentation()
+            override = self._get_collection_image_override(path)
+            if override:
+                self._apply_settings_payload(override)
             self._clear_document_history()
             self._push_document_history()
 
-    def _populate_filmstrip(self, folder: str = None):
-        """Populate the filmstrip with imported images."""
+    def _populate_filmstrip(self):
+        """Populate the filmstrip with the active collection's images."""
         # Clear old filmstrip.
         for widget in self._filmstrip_items.values():
             widget.deleteLater()
         self._filmstrip_items.clear()
+        if self._filmstrip_placeholder is not None:
+            self._filmstrip_placeholder.deleteLater()
+            self._filmstrip_placeholder = None
         self._filmstrip_images = list(self._imported_images)
+        self._import_queue = [p for p in self._import_queue if p in self._filmstrip_images]
+
+        if not self._filmstrip_images:
+            placeholder = QLabel(
+                "No images — use Import Folder (Ctrl+I) to add a collection.", self
+            )
+            placeholder.setObjectName("MutedLabel")
+            placeholder.setAlignment(Qt.AlignCenter)
+            self._filmstrip_layout.addWidget(placeholder)
+            self._filmstrip_placeholder = placeholder
+            return
 
         # Create thumbnails for imported images.
         for img_path in self._filmstrip_images:
@@ -5112,17 +5556,16 @@ class PortraitEnhancerQtWindow(QMainWindow):
                 continue
             thumb = FilmstripThumbnail(img_path, self)
             thumb.clicked.connect(self._on_filmstrip_image_clicked)
+            thumb.remove_requested.connect(self._remove_image_from_collection)
             self._filmstrip_layout.addWidget(thumb)
             self._filmstrip_items[img_path] = thumb
 
-            # Use cached thumbnail if available, otherwise load.
+            # Use cached thumbnail if available, otherwise queue it for background load.
             cached_thumb = self._get_cached_thumbnail(img_path)
             if cached_thumb is not None:
                 thumb.set_pixmap(cached_thumb)
-            else:
-                # Check if thumbnail is in queue; if not, queue it.
-                if img_path not in self._import_queue:
-                    self._import_queue.append(img_path)
+            elif img_path not in self._import_queue:
+                self._import_queue.append(img_path)
 
         self._filmstrip_layout.addStretch(1)
         self._update_filmstrip_active()
@@ -5132,13 +5575,14 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self._import_worker_timer.start()
 
     def _import_folder(self):
-        """Open import dialog and start importing images from selected folder."""
-        dialog = ImportDialog(self, self.SUPPORTED_IMAGE_EXTS)
+        """Open import dialog and import images from a folder into a collection."""
+        dialog = ImportDialog(self, self.SUPPORTED_IMAGE_EXTS, existing_collections=list(self._collections.keys()))
         if dialog.exec() != QDialog.Accepted:
             return
 
         folder = dialog.selected_folder()
-        if not folder:
+        collection_name = dialog.collection_name()
+        if not folder or not collection_name:
             return
 
         # Scan folder for images.
@@ -5148,28 +5592,61 @@ class PortraitEnhancerQtWindow(QMainWindow):
             p for p in folder_path.iterdir()
             if p.is_file() and p.suffix.lower() in supported
         )
-        new_images = [str(p) for p in image_files if str(p) not in self._imported_images]
+        all_paths = [str(p) for p in image_files]
 
+        collection = self._collections.setdefault(
+            collection_name,
+            {
+                "images": [],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "source_folder": folder,
+                "image_overrides": {},
+            },
+        )
+        existing = set(collection["images"])
+        new_images = [p for p in all_paths if p not in existing]
         if not new_images:
-            self.statusBar().showMessage(f"No new images to import from {folder}")
+            self.statusBar().showMessage(f"No new images to import into \"{collection_name}\"")
             return
 
-        # Add to imported images and queue for thumbnail generation.
-        self._imported_images.extend(new_images)
+        collection["images"].extend(new_images)
+        collection["source_folder"] = folder
+
+        self._active_collection = collection_name
         self._import_queue.extend(new_images)
+        self._refresh_collection_combo()
+        self._apply_active_collection()
+        self._save_collections_state()
 
-        # Refresh filmstrip.
-        self._populate_filmstrip()
-
-        # Start import worker.
         if not self._import_worker_timer.isActive():
             self._import_worker_timer.start()
 
-        self.statusBar().showMessage(f"Importing {len(new_images)} images from {Path(folder).name}...")
+        self.statusBar().showMessage(
+            f"Imported {len(new_images)} new image(s) into \"{collection_name}\" ({len(collection['images'])} total)"
+        )
+
+    def _remove_image_from_collection(self, path: str):
+        """Remove an image from the active collection (does not delete the file)."""
+        if not self._active_collection or self._active_collection not in self._collections:
+            return
+        collection = self._collections[self._active_collection]
+        images = collection.get("images", [])
+        if path not in images:
+            return
+        images.remove(path)
+        collection.get("image_overrides", {}).pop(path, None)
+        self._save_collections_state()
+        self._refresh_collection_combo()
+        self._apply_active_collection()
+        self.statusBar().showMessage(f"Removed from \"{self._active_collection}\"")
 
     def _get_cached_thumbnail(self, img_path: str):
-        """Get cached thumbnail if available, None otherwise."""
-        # For now, just return None - we'll implement caching if needed.
+        """Get a disk-cached thumbnail pixmap if available, None otherwise."""
+        cache_path = self._thumbnail_cache_path(img_path)
+        if cache_path.is_file():
+            pixmap = QPixmap(str(cache_path))
+            if not pixmap.isNull():
+                return pixmap
         return None
 
     def _process_import_queue(self):
@@ -5185,17 +5662,14 @@ class PortraitEnhancerQtWindow(QMainWindow):
             # Image not in filmstrip yet (shouldn't happen, but handle gracefully).
             return
 
-        thumb_widget = self._filmstrip_items[img_path]
-
         # Load thumbnail in background thread.
         def load_and_set():
             pixmap = self._load_thumbnail_blocking(img_path)
             if pixmap is not None and img_path in self._filmstrip_items:
                 self._filmstrip_items[img_path].set_pixmap(pixmap)
 
-        worker = lambda: load_and_set()
         import threading
-        thread = threading.Thread(target=worker, daemon=True)
+        thread = threading.Thread(target=load_and_set, daemon=True)
         thread.start()
 
         # Update status bar with progress.
@@ -5230,62 +5704,20 @@ class PortraitEnhancerQtWindow(QMainWindow):
             img_uint8 = (np.clip(img_array, 0, 1) * 255).astype(np.uint8)
             h, w = img_uint8.shape[:2]
             if len(img_uint8.shape) == 3 and img_uint8.shape[2] == 3:
-                qimg = QImage(img_uint8.data, w, h, 3 * w, QImage.Format_RGB888)
+                qimg = QImage(img_uint8.data, w, h, 3 * w, QImage.Format_RGB888).copy()
             else:
                 # Grayscale, convert to RGB.
                 img_uint8_rgb = np.stack([img_uint8] * 3, axis=-1)
-                qimg = QImage(img_uint8_rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+                qimg = QImage(img_uint8_rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+
+            try:
+                qimg.save(str(self._thumbnail_cache_path(img_path)), "JPEG", 85)
+            except Exception:
+                pass
 
             return QPixmap.fromImage(qimg)
         except Exception:
             return None
-
-    def _load_thumbnail_async(self, img_path: str, thumb_widget: FilmstripThumbnail):
-        """Load a thumbnail image asynchronously (worker thread)."""
-        def load_thumb():
-            try:
-                ext = Path(img_path).suffix.lower()
-                if ext in {".cr2", ".nef", ".arw", ".dng", ".raw"}:
-                    if not HAS_RAWPY:
-                        return None
-                    with rawpy.imread(img_path) as raw:
-                        rgb16 = raw.postprocess(use_camera_wb=True, output_bps=16)
-                    img_array = rgb16.astype(np.float32) / 65535.0
-                else:
-                    pil = Image.open(img_path).convert("RGB")
-                    img_array = np.asarray(pil, dtype=np.float32) / 255.0
-
-                # Scale to fit thumbnail (max 200x200 for speed).
-                h, w = img_array.shape[:2]
-                max_dim = 200
-                if w > max_dim or h > max_dim:
-                    scale = max_dim / max(w, h)
-                    new_w, new_h = int(w * scale), int(h * scale)
-                    img_array = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-                # Convert to QPixmap.
-                img_uint8 = (np.clip(img_array, 0, 1) * 255).astype(np.uint8)
-                h, w = img_uint8.shape[:2]
-                if len(img_uint8.shape) == 3 and img_uint8.shape[2] == 3:
-                    qimg = QImage(img_uint8.data, w, h, 3 * w, QImage.Format_RGB888)
-                else:
-                    # Grayscale, convert to RGB.
-                    img_uint8_rgb = np.stack([img_uint8] * 3, axis=-1)
-                    qimg = QImage(img_uint8_rgb.data, w, h, 3 * w, QImage.Format_RGB888)
-
-                return QPixmap.fromImage(qimg)
-            except Exception:
-                return None
-
-        def set_thumb(pixmap):
-            if pixmap is not None and img_path in self._filmstrip_items:
-                self._filmstrip_items[img_path].set_pixmap(pixmap)
-
-        # Run in thread pool to avoid blocking UI.
-        worker = lambda: set_thumb(load_thumb())
-        import threading
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
 
     def _update_filmstrip_active(self):
         """Highlight the current image in the filmstrip."""
@@ -5300,7 +5732,10 @@ class PortraitEnhancerQtWindow(QMainWindow):
         if not Path(path).is_file():
             self.statusBar().showMessage(f"File not found: {path}")
             return
-        self.open_image(path)
+        try:
+            self._load_image_path(path)
+        except Exception as ex:
+            QMessageBox.critical(self, "Load Error", str(ex))
 
     def _read_image_file(self, path: str):
         ext = Path(path).suffix.lower()
