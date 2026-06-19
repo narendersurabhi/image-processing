@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Build artifacts
+*.egg-info/
+
+# Caches
+.pytest_cache/
+.ort_coreml_cache/
+
+# Lock files
+uv.lock
+
+# Binary model files
+models/*.onnx
+models/*.task
+models/*.tflite
+
+# Preset state
+presets/.preset_browser_state.json
