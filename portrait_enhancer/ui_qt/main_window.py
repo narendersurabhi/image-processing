@@ -1549,6 +1549,74 @@ class PreviewRenderTask(QRunnable):
         self.signals.finished.emit(self.job_id, result, float(elapsed_ms))
 
 
+class ImportDialog(QDialog):
+    """Dialog to import images from a folder."""
+
+    def __init__(self, parent=None, supported_exts=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Images")
+        self.setModal(True)
+        self.resize(600, 200)
+        self._supported_exts = supported_exts or {".cr2", ".nef", ".arw", ".dng", ".raw", ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+        self._selected_folder = None
+        self._image_count = 0
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        info = QLabel("Select a folder to import images from", self)
+        info.setStyleSheet("font-weight: 600;")
+        layout.addWidget(info)
+
+        folder_layout = QHBoxLayout()
+        self.folder_label = QLineEdit(self)
+        self.folder_label.setReadOnly(True)
+        self.folder_label.setPlaceholderText("No folder selected")
+        folder_layout.addWidget(self.folder_label)
+        self.browse_btn = QPushButton("Browse...", self)
+        self.browse_btn.setMaximumWidth(100)
+        self.browse_btn.clicked.connect(self._browse_folder)
+        folder_layout.addWidget(self.browse_btn)
+        layout.addLayout(folder_layout)
+
+        self.count_label = QLabel("", self)
+        self.count_label.setObjectName("MutedLabel")
+        layout.addWidget(self.count_label)
+
+        layout.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.ok_btn = buttons.button(QDialogButtonBox.Ok)
+        self.ok_btn.setEnabled(False)
+        layout.addWidget(buttons)
+
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Import")
+        if not folder:
+            return
+        self._selected_folder = folder
+        self.folder_label.setText(folder)
+
+        # Count images in the folder.
+        try:
+            folder_path = Path(folder)
+            images = [p for p in folder_path.iterdir() if p.is_file() and p.suffix.lower() in self._supported_exts]
+            self._image_count = len(images)
+            self.count_label.setText(f"Found {self._image_count} image{'s' if self._image_count != 1 else ''}")
+            self.ok_btn.setEnabled(self._image_count > 0)
+        except Exception as e:
+            self.count_label.setText(f"Error: {str(e)}")
+            self.ok_btn.setEnabled(False)
+
+    def selected_folder(self):
+        return self._selected_folder
+
+    def image_count(self):
+        return self._image_count
+
+
 class FilmstripThumbnail(QFrame):
     """Clickable thumbnail widget for the image filmstrip."""
 
@@ -1709,6 +1777,14 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._focus_mode = False
         self._focus_restore = None
         self._settings_clipboard = None
+        self._imported_images = []
+        self._import_queue = []
+        self._import_worker_timer = QTimer(self)
+        self._import_worker_timer.setSingleShot(False)
+        self._import_worker_timer.setInterval(500)
+        self._import_worker_timer.timeout.connect(self._process_import_queue)
+        self._import_thread_pool = QThreadPool(self)
+        self._import_thread_pool.setMaxThreadCount(1)
 
         self._color_settings = self._default_color_settings()
         self._runtime_settings = {"acceleration_mode": "auto"}
@@ -1905,6 +1981,9 @@ class PortraitEnhancerQtWindow(QMainWindow):
         open_action = QAction("Open Image", self)
         open_action.setShortcut(QKeySequence.Open)
         open_action.triggered.connect(self.open_image)
+        import_action = QAction("Import Folder", self)
+        import_action.setShortcut("Ctrl+I")
+        import_action.triggered.connect(self._import_folder)
         undo_action = QAction("Undo", self)
         undo_action.setShortcut(QKeySequence.Undo)
         undo_action.triggered.connect(self._undo_document_state)
@@ -1967,6 +2046,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._focus_action.toggled.connect(self._on_focus_mode_toggled)
         for action in (
             open_action,
+            import_action,
             open_project_action,
             save_project_action,
             undo_action,
@@ -4989,7 +5069,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self.file_path = path
         self.statusBar().showMessage(f"Loading {os.path.basename(path)} ...")
         self.image_label.reset_view()
-        self._populate_filmstrip(str(Path(path).parent))
+        self._populate_filmstrip()
         full = self._read_image_file(path)
         preview, scale = self._build_preview_proxy(full)
         interactive_preview, interactive_ratio = self._build_interactive_preview_proxy(preview)
@@ -5018,38 +5098,147 @@ class PortraitEnhancerQtWindow(QMainWindow):
             self._clear_document_history()
             self._push_document_history()
 
-    def _populate_filmstrip(self, folder: str):
-        """Scan folder for images and populate the filmstrip."""
-        folder_path = Path(folder)
-        if not folder_path.is_dir():
-            return
-
+    def _populate_filmstrip(self, folder: str = None):
+        """Populate the filmstrip with imported images."""
         # Clear old filmstrip.
         for widget in self._filmstrip_items.values():
             widget.deleteLater()
         self._filmstrip_items.clear()
-        self._filmstrip_images.clear()
+        self._filmstrip_images = list(self._imported_images)
 
-        # Scan for supported image files.
-        supported = self.SUPPORTED_IMAGE_EXTS
-        image_files = sorted(
-            p for p in folder_path.iterdir()
-            if p.is_file() and p.suffix.lower() in supported
-        )
-        self._filmstrip_images = [str(p) for p in image_files]
-
-        # Create thumbnails.
+        # Create thumbnails for imported images.
         for img_path in self._filmstrip_images:
+            if not Path(img_path).is_file():
+                continue
             thumb = FilmstripThumbnail(img_path, self)
             thumb.clicked.connect(self._on_filmstrip_image_clicked)
             self._filmstrip_layout.addWidget(thumb)
             self._filmstrip_items[img_path] = thumb
 
-            # Load thumbnail asynchronously to avoid blocking.
-            self._load_thumbnail_async(img_path, thumb)
+            # Use cached thumbnail if available, otherwise load.
+            cached_thumb = self._get_cached_thumbnail(img_path)
+            if cached_thumb is not None:
+                thumb.set_pixmap(cached_thumb)
+            else:
+                # Check if thumbnail is in queue; if not, queue it.
+                if img_path not in self._import_queue:
+                    self._import_queue.append(img_path)
 
         self._filmstrip_layout.addStretch(1)
         self._update_filmstrip_active()
+
+        # Start the import worker if not running.
+        if self._import_queue and not self._import_worker_timer.isActive():
+            self._import_worker_timer.start()
+
+    def _import_folder(self):
+        """Open import dialog and start importing images from selected folder."""
+        dialog = ImportDialog(self, self.SUPPORTED_IMAGE_EXTS)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        folder = dialog.selected_folder()
+        if not folder:
+            return
+
+        # Scan folder for images.
+        folder_path = Path(folder)
+        supported = self.SUPPORTED_IMAGE_EXTS
+        image_files = sorted(
+            p for p in folder_path.iterdir()
+            if p.is_file() and p.suffix.lower() in supported
+        )
+        new_images = [str(p) for p in image_files if str(p) not in self._imported_images]
+
+        if not new_images:
+            self.statusBar().showMessage(f"No new images to import from {folder}")
+            return
+
+        # Add to imported images and queue for thumbnail generation.
+        self._imported_images.extend(new_images)
+        self._import_queue.extend(new_images)
+
+        # Refresh filmstrip.
+        self._populate_filmstrip()
+
+        # Start import worker.
+        if not self._import_worker_timer.isActive():
+            self._import_worker_timer.start()
+
+        self.statusBar().showMessage(f"Importing {len(new_images)} images from {Path(folder).name}...")
+
+    def _get_cached_thumbnail(self, img_path: str):
+        """Get cached thumbnail if available, None otherwise."""
+        # For now, just return None - we'll implement caching if needed.
+        return None
+
+    def _process_import_queue(self):
+        """Process next image in import queue (called by timer every 500ms)."""
+        if not self._import_queue:
+            self._import_worker_timer.stop()
+            if self._imported_images:
+                self.statusBar().showMessage(f"Imported {len(self._imported_images)} images")
+            return
+
+        img_path = self._import_queue.pop(0)
+        if img_path not in self._filmstrip_items:
+            # Image not in filmstrip yet (shouldn't happen, but handle gracefully).
+            return
+
+        thumb_widget = self._filmstrip_items[img_path]
+
+        # Load thumbnail in background thread.
+        def load_and_set():
+            pixmap = self._load_thumbnail_blocking(img_path)
+            if pixmap is not None and img_path in self._filmstrip_items:
+                self._filmstrip_items[img_path].set_pixmap(pixmap)
+
+        worker = lambda: load_and_set()
+        import threading
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        # Update status bar with progress.
+        remaining = len(self._import_queue)
+        total = len(self._imported_images)
+        processed = total - remaining
+        self.statusBar().showMessage(f"Importing: {processed}/{total} thumbnails...")
+
+    def _load_thumbnail_blocking(self, img_path: str):
+        """Load a single thumbnail (blocking, meant for worker thread)."""
+        try:
+            ext = Path(img_path).suffix.lower()
+            if ext in {".cr2", ".nef", ".arw", ".dng", ".raw"}:
+                if not HAS_RAWPY:
+                    return None
+                with rawpy.imread(img_path) as raw:
+                    rgb16 = raw.postprocess(use_camera_wb=True, output_bps=16)
+                img_array = rgb16.astype(np.float32) / 65535.0
+            else:
+                pil = Image.open(img_path).convert("RGB")
+                img_array = np.asarray(pil, dtype=np.float32) / 255.0
+
+            # Scale to fit thumbnail (max 200x200 for speed).
+            h, w = img_array.shape[:2]
+            max_dim = 200
+            if w > max_dim or h > max_dim:
+                scale = max_dim / max(w, h)
+                new_w, new_h = int(w * scale), int(h * scale)
+                img_array = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            # Convert to QPixmap.
+            img_uint8 = (np.clip(img_array, 0, 1) * 255).astype(np.uint8)
+            h, w = img_uint8.shape[:2]
+            if len(img_uint8.shape) == 3 and img_uint8.shape[2] == 3:
+                qimg = QImage(img_uint8.data, w, h, 3 * w, QImage.Format_RGB888)
+            else:
+                # Grayscale, convert to RGB.
+                img_uint8_rgb = np.stack([img_uint8] * 3, axis=-1)
+                qimg = QImage(img_uint8_rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+
+            return QPixmap.fromImage(qimg)
+        except Exception:
+            return None
 
     def _load_thumbnail_async(self, img_path: str, thumb_widget: FilmstripThumbnail):
         """Load a thumbnail image asynchronously (worker thread)."""
