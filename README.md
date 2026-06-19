@@ -114,7 +114,7 @@ uv run --extra dev pytest
     - Lightroom-style workspace: left navigation/presets, center canvas, right editing inspector grouped by task (Portrait / Masks / Basic / Color)
     - collapsible chrome to enlarge the canvas: toggle the left panel (`Ctrl+Shift+L`), right inspector (`Ctrl+Shift+R`), or a Focus mode that hides all panels/bars (`Ctrl+Shift+F`)
     - canvas zoom/pan: trackpad pinch (or `Ctrl`/`Cmd`+scroll) zooms toward the cursor, two-finger scroll / left-drag pans when zoomed in, double-click resets to fit — mask paint, crop, and white-balance picking stay pixel-accurate at any zoom
-    - bottom filmstrip: when you open an image, the app scans the folder and shows thumbnails of all RAW/JPEG/PNG/TIFF files in a horizontal scrollable panel; click a thumbnail to switch images (Lightroom-style workflow)
+    - import folder & background thumbnailing: `Import Folder` (Ctrl+I) opens a dialog to select a folder; shows preview of how many images will be imported; imports them and queues thumbnails for background processing (one every 500ms so resources don't get hogged). Filmstrip shows only imported images, not every file in the current folder. Status bar shows "Importing: 12/47 thumbnails..." as it processes. User can continue editing while import runs in background
     - copy/paste settings: `Copy Settings` (Ctrl+Alt+C) snapshots global and selective adjustments, layer mix, and color settings to a clipboard; `Paste Settings` (Ctrl+Alt+V) applies them to another image in the same session
     - export dialog: JPEG/PNG/TIFF, JPEG quality, optional long-edge resize, keep-metadata (EXIF/ICC/DPI) toggle, destination + filename preview
 3. The Tk app still has the deeper feature set today for some advanced mask-edit workflows.
