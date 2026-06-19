@@ -23,7 +23,7 @@ try:
 except ImportError:
     HAS_RAWPY = False
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QSize, QEvent, QUrl, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QSize, QEvent, QPointF, QRectF, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -781,6 +781,13 @@ class ImagePreviewLabel(QLabel):
         self.setMouseTracking(True)
         self._pixmap = None
         self._scaled_pixmap = None
+        self._zoom = 1.0
+        self._min_zoom = 1.0
+        self._max_zoom = 8.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._panning = False
+        self._pan_last = None
         self._compare_mode = "off"
         self._split_callback = None
         self._dragging_split = False
@@ -808,6 +815,13 @@ class ImagePreviewLabel(QLabel):
         self._pixmap = pixmap
         self._pixmap_image = pixmap.toImage() if pixmap is not None else None
         self._apply_scaled_pixmap()
+
+    def reset_view(self):
+        """Reset zoom/pan to fit-the-window."""
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self.update()
 
     def set_compare_state(self, mode: str, split_callback=None):
         self._compare_mode = str(mode or "off")
@@ -849,25 +863,119 @@ class ImagePreviewLabel(QLabel):
         self.setCursor(Qt.CrossCursor if self._wb_pick_enabled else Qt.ArrowCursor)
         self.update()
 
-    def _pixmap_rect(self):
-        """(x0, y0, w, h) of the displayed pixmap inside the widget, or None."""
-        pix = self._scaled_pixmap if self._scaled_pixmap is not None else self.pixmap()
-        if pix is None or pix.width() <= 0 or pix.height() <= 0:
-            return None
+    def event(self, e):
+        # macOS trackpad pinch arrives as a native zoom gesture.
+        if e.type() == QEvent.NativeGesture and e.gestureType() == Qt.ZoomNativeGesture:
+            self._set_zoom(self._zoom * (1.0 + e.value()), e.position())
+            return True
+        return super().event(e)
+
+    def wheelEvent(self, event):
+        if self._pixmap is None:
+            super().wheelEvent(event)
+            return
+        mods = event.modifiers()
+        if mods & (Qt.ControlModifier | Qt.MetaModifier):
+            # Ctrl/Cmd + wheel zooms (non-trackpad fallback for pinch).
+            self._set_zoom(self._zoom * (1.0 + event.angleDelta().y() / 1200.0), event.position())
+            event.accept()
+            return
+        if self._zoom > 1.0 + 1e-6:
+            # Two-finger scroll pans while zoomed in.
+            delta = event.pixelDelta()
+            if delta.isNull():
+                delta = event.angleDelta() / 8
+            self._pan_x += delta.x()
+            self._pan_y += delta.y()
+            self._clamp_pan()
+            self.update()
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        # Double-click resets the view, but only when no edit tool owns the click.
+        if not self._edit_enabled and self._crop_overlay is None and not self._wb_pick_enabled:
+            self.reset_view()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _fit_scale(self) -> float:
+        """Scale that fits the source pixmap to the widget (KeepAspectRatio)."""
+        if self._pixmap is None:
+            return 0.0
+        iw, ih = self._pixmap.width(), self._pixmap.height()
+        if iw <= 0 or ih <= 0:
+            return 0.0
         rect = self.contentsRect()
-        x0 = rect.x() + (rect.width() - pix.width()) / 2.0
-        y0 = rect.y() + (rect.height() - pix.height()) / 2.0
-        return x0, y0, float(pix.width()), float(pix.height())
+        return min(rect.width() / float(iw), rect.height() / float(ih))
+
+    def _pixmap_rect(self):
+        """(x0, y0, w, h) of the displayed image inside the widget, including the
+        current zoom and pan. Single source of truth for every coordinate map."""
+        if self._pixmap is None:
+            return None
+        iw, ih = self._pixmap.width(), self._pixmap.height()
+        if iw <= 0 or ih <= 0:
+            return None
+        scale = self._fit_scale() * self._zoom
+        pw = iw * scale
+        ph = ih * scale
+        rect = self.contentsRect()
+        x0 = rect.x() + (rect.width() - pw) / 2.0 + self._pan_x
+        y0 = rect.y() + (rect.height() - ph) / 2.0 + self._pan_y
+        return x0, y0, pw, ph
 
     def _widget_to_norm(self, wx: float, wy: float):
         geom = self._pixmap_rect()
         if geom is None:
             return None
         x0, y0, pw, ph = geom
+        if pw <= 0 or ph <= 0:
+            return None
         return (float(wx) - x0) / pw, (float(wy) - y0) / ph
+
+    def _clamp_pan(self):
+        """Keep the zoomed image covering the viewport (no drift past edges)."""
+        if self._pixmap is None or self._zoom <= 1.0 + 1e-6:
+            self._pan_x = 0.0
+            self._pan_y = 0.0
+            return
+        rect = self.contentsRect()
+        scale = self._fit_scale() * self._zoom
+        pw = self._pixmap.width() * scale
+        ph = self._pixmap.height() * scale
+        ex = max(0.0, (pw - rect.width()) / 2.0)
+        ey = max(0.0, (ph - rect.height()) / 2.0)
+        self._pan_x = max(-ex, min(ex, self._pan_x))
+        self._pan_y = max(-ey, min(ey, self._pan_y))
+
+    def _set_zoom(self, new_zoom: float, center=None):
+        new_zoom = max(self._min_zoom, min(self._max_zoom, float(new_zoom)))
+        if abs(new_zoom - self._zoom) < 1e-4 or self._pixmap is None:
+            return
+        # Keep the point under the cursor stationary while zooming.
+        norm = self._widget_to_norm(center.x(), center.y()) if center is not None else None
+        self._zoom = new_zoom
+        if self._zoom <= 1.0 + 1e-6:
+            self._pan_x = 0.0
+            self._pan_y = 0.0
+        elif norm is not None and 0.0 <= norm[0] <= 1.0 and 0.0 <= norm[1] <= 1.0:
+            rect = self.contentsRect()
+            scale = self._fit_scale() * self._zoom
+            pw = self._pixmap.width() * scale
+            ph = self._pixmap.height() * scale
+            base_x0 = rect.x() + (rect.width() - pw) / 2.0
+            base_y0 = rect.y() + (rect.height() - ph) / 2.0
+            self._pan_x = center.x() - (base_x0 + norm[0] * pw)
+            self._pan_y = center.y() - (base_y0 + norm[1] * ph)
+        self._clamp_pan()
+        self.update()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._clamp_pan()
         self._apply_scaled_pixmap()
 
     def leaveEvent(self, event):
@@ -961,22 +1069,32 @@ class ImagePreviewLabel(QLabel):
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        if self._pixmap is not None:
+            geom = self._pixmap_rect()
+            if geom is not None:
+                x0, y0, pw, ph = geom
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                painter.setClipRect(self.contentsRect())
+                painter.drawPixmap(QRectF(x0, y0, pw, ph), self._pixmap, QRectF(self._pixmap.rect()))
+                painter.end()
         if self._crop_overlay is not None:
             self._paint_crop_overlay()
         if self._wb_pick_enabled:
             self._paint_wb_loupe()
-        if not self._edit_enabled or self._hover_rel is None or self._scaled_pixmap is None:
+        if not self._edit_enabled or self._hover_rel is None or self._pixmap is None:
             return
         if not self._source_image_size or self._source_image_size[0] <= 0 or self._source_image_size[1] <= 0:
             return
 
-        rect = self.contentsRect()
-        x0 = rect.x() + (rect.width() - self._scaled_pixmap.width()) / 2.0
-        y0 = rect.y() + (rect.height() - self._scaled_pixmap.height()) / 2.0
-        cx = x0 + self._hover_rel[0] * self._scaled_pixmap.width()
-        cy = y0 + self._hover_rel[1] * self._scaled_pixmap.height()
-        scale_x = self._scaled_pixmap.width() / float(self._source_image_size[0])
-        scale_y = self._scaled_pixmap.height() / float(self._source_image_size[1])
+        geom = self._pixmap_rect()
+        if geom is None:
+            return
+        x0, y0, pw, ph = geom
+        cx = x0 + self._hover_rel[0] * pw
+        cy = y0 + self._hover_rel[1] * ph
+        scale_x = pw / float(self._source_image_size[0])
+        scale_y = ph / float(self._source_image_size[1])
         radius = max(2.0, self._brush_radius * min(scale_x, scale_y))
         hardness = max(0.0, min(1.0, self._brush_hardness / 100.0))
         inner_radius = max(1.0, radius * hardness)
@@ -1036,6 +1154,13 @@ class ImagePreviewLabel(QLabel):
             self._emit_split_position(event.position().x())
             event.accept()
             return
+        if event.button() == Qt.LeftButton and self._zoom > 1.0 + 1e-6:
+            # No edit tool active and zoomed in: left-drag pans the canvas.
+            self._panning = True
+            self._pan_last = event.position()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def _crop_handle_tolerance(self) -> float:
@@ -1046,6 +1171,15 @@ class ImagePreviewLabel(QLabel):
         return max(0.02, 10.0 / max(1.0, pw))
 
     def mouseMoveEvent(self, event):
+        if self._panning and self._pan_last is not None:
+            pos = event.position()
+            self._pan_x += pos.x() - self._pan_last.x()
+            self._pan_y += pos.y() - self._pan_last.y()
+            self._pan_last = pos
+            self._clamp_pan()
+            self.update()
+            event.accept()
+            return
         if self._wb_pick_enabled:
             norm = self._widget_to_norm(event.position().x(), event.position().y())
             pix = self._pixmap
@@ -1091,32 +1225,28 @@ class ImagePreviewLabel(QLabel):
                 self._crop_drag_last = None
                 if self._crop_commit_callback is not None:
                     self._crop_commit_callback()
+            if self._panning:
+                self._panning = False
+                self._pan_last = None
+                self.setCursor(Qt.CrossCursor if self._wb_pick_enabled else Qt.ArrowCursor)
             self._dragging_split = False
             self._dragging_paint = False
         super().mouseReleaseEvent(event)
 
     def _apply_scaled_pixmap(self):
+        # The image is painted manually in paintEvent (so it can be zoomed/panned);
+        # QLabel only shows the placeholder text when there is no image.
         if self._pixmap is None:
             self._scaled_pixmap = None
-            self.clear()
             self.setText("Open an image to begin")
-            return
-        self._scaled_pixmap = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.setPixmap(self._scaled_pixmap)
+        else:
+            self.setText("")
         self.update()
 
     def _update_hover_rel(self, widget_x: float, widget_y: float):
-        pix = self.pixmap()
-        if pix is None or pix.width() <= 0 or pix.height() <= 0:
-            self._hover_rel = None
-            self.update()
-            return
-        x0 = (self.width() - pix.width()) / 2.0
-        y0 = (self.height() - pix.height()) / 2.0
-        rel_x = (float(widget_x) - x0) / float(pix.width())
-        rel_y = (float(widget_y) - y0) / float(pix.height())
-        if 0.0 <= rel_x <= 1.0 and 0.0 <= rel_y <= 1.0:
-            self._hover_rel = (rel_x, rel_y)
+        norm = self._widget_to_norm(widget_x, widget_y)
+        if norm is not None and 0.0 <= norm[0] <= 1.0 and 0.0 <= norm[1] <= 1.0:
+            self._hover_rel = norm
         else:
             self._hover_rel = None
         self.update()
@@ -1124,25 +1254,19 @@ class ImagePreviewLabel(QLabel):
     def _emit_split_position(self, widget_x: float):
         if self._split_callback is None:
             return
-        pix = self.pixmap()
-        if pix is None or pix.width() <= 0:
+        geom = self._pixmap_rect()
+        if geom is None:
             return
-        x0 = (self.width() - pix.width()) / 2.0
-        rel_x = (float(widget_x) - x0) / float(pix.width())
+        x0, _y0, pw, _ph = geom
+        rel_x = (float(widget_x) - x0) / pw
         self._split_callback(max(0.0, min(1.0, rel_x)))
 
     def _emit_paint_point(self, widget_x: float, widget_y: float):
         if self._paint_callback is None:
             return
-        pix = self.pixmap()
-        if pix is None or pix.width() <= 0 or pix.height() <= 0:
-            return
-        x0 = (self.width() - pix.width()) / 2.0
-        y0 = (self.height() - pix.height()) / 2.0
-        rel_x = (float(widget_x) - x0) / float(pix.width())
-        rel_y = (float(widget_y) - y0) / float(pix.height())
-        if 0.0 <= rel_x <= 1.0 and 0.0 <= rel_y <= 1.0:
-            self._paint_callback(rel_x, rel_y)
+        norm = self._widget_to_norm(widget_x, widget_y)
+        if norm is not None and 0.0 <= norm[0] <= 1.0 and 0.0 <= norm[1] <= 1.0:
+            self._paint_callback(norm[0], norm[1])
 
 
 class HistogramWidget(QWidget):
@@ -1512,6 +1636,8 @@ class PortraitEnhancerQtWindow(QMainWindow):
         self._render_in_flight = False
         self._render_pending = False
         self._slider_drag_active = 0
+        self._focus_mode = False
+        self._focus_restore = None
 
         self._color_settings = self._default_color_settings()
         self._runtime_settings = {"acceleration_mode": "auto"}
@@ -1740,6 +1866,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         reset_action.triggered.connect(self.reset_all)
 
         toolbar = self.addToolBar("Main")
+        self._main_toolbar = toolbar
         toolbar.setObjectName("MainToolbar")
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(18, 18))
@@ -1762,7 +1889,34 @@ class PortraitEnhancerQtWindow(QMainWindow):
         spacer = QWidget(self)
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(spacer)
+
+        # View toggles: collapse the side panels / all chrome to enlarge the canvas.
+        self._left_panel_action = QAction("◧ Left", self)
+        self._left_panel_action.setCheckable(True)
+        self._left_panel_action.setChecked(True)
+        self._left_panel_action.setShortcut("Ctrl+Shift+L")
+        self._left_panel_action.setToolTip("Show/hide the left panel (Ctrl+Shift+L)")
+        self._left_panel_action.toggled.connect(self._on_left_panel_toggled)
+        self._right_panel_action = QAction("Right ◨", self)
+        self._right_panel_action.setCheckable(True)
+        self._right_panel_action.setChecked(True)
+        self._right_panel_action.setShortcut("Ctrl+Shift+R")
+        self._right_panel_action.setToolTip("Show/hide the right inspector (Ctrl+Shift+R)")
+        self._right_panel_action.toggled.connect(self._on_right_panel_toggled)
+        self._focus_action = QAction("Focus", self)
+        self._focus_action.setCheckable(True)
+        self._focus_action.setShortcut("Ctrl+Shift+F")
+        self._focus_action.setToolTip("Focus mode — hide all panels and bars (Ctrl+Shift+F)")
+        self._focus_action.toggled.connect(self._on_focus_mode_toggled)
+        toolbar.addAction(self._left_panel_action)
+        toolbar.addAction(self._right_panel_action)
+        toolbar.addAction(self._focus_action)
+        toolbar.addSeparator()
         toolbar.addAction(export_action)
+        # Register on the window too so the shortcuts work even when the toolbar
+        # itself is hidden in focus mode.
+        for view_action in (self._left_panel_action, self._right_panel_action, self._focus_action):
+            self.addAction(view_action)
 
         def make_button(text: str, callback, primary: bool = False):
             button = QPushButton(text, self)
@@ -1783,6 +1937,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         root.addWidget(splitter, 1)
 
         nav_panel = QFrame(self)
+        self._nav_panel = nav_panel
         nav_panel.setObjectName("SidePanel")
         nav_panel.setMinimumWidth(280)
         nav_panel.setMaximumWidth(340)
@@ -1912,6 +2067,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         center_layout.setSpacing(10)
 
         canvas_header = QFrame(self)
+        self._canvas_header = canvas_header
         canvas_header.setObjectName("CanvasHeader")
         canvas_header_layout = QVBoxLayout(canvas_header)
         canvas_header_layout.setContentsMargins(12, 10, 12, 10)
@@ -1964,6 +2120,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         center_layout.addWidget(canvas_frame, 1)
 
         status_panel = QFrame(self)
+        self._status_panel = status_panel
         status_panel.setObjectName("StatusStrip")
         status_layout = QVBoxLayout(status_panel)
         status_layout.setContentsMargins(12, 8, 12, 10)
@@ -2327,6 +2484,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         inspector_layout.addStretch(1)
 
         inspector_scroll = QScrollArea(self)
+        self._inspector_scroll = inspector_scroll
         inspector_scroll.setObjectName("InspectorScroll")
         inspector_scroll.setWidgetResizable(True)
         inspector_scroll.setFrameShape(QFrame.NoFrame)
@@ -2341,6 +2499,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([300, 860, 420])
+        self._splitter = splitter
 
         self._apply_window_style()
         self._refresh_mask_controls()
@@ -3691,6 +3850,39 @@ class PortraitEnhancerQtWindow(QMainWindow):
         state["readiness_seen"] = True
         self._write_browser_state(state)
 
+    def _on_left_panel_toggled(self, visible: bool):
+        self._nav_panel.setVisible(bool(visible))
+
+    def _on_right_panel_toggled(self, visible: bool):
+        self._inspector_scroll.setVisible(bool(visible))
+
+    def _on_focus_mode_toggled(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self._focus_mode:
+            return
+        self._focus_mode = enabled
+        if enabled:
+            # Remember the side-panel state so exiting focus restores it.
+            self._focus_restore = (
+                self._nav_panel.isVisible(),
+                self._inspector_scroll.isVisible(),
+            )
+            self._main_toolbar.setVisible(False)
+            self._canvas_header.setVisible(False)
+            self._status_panel.setVisible(False)
+            self._nav_panel.setVisible(False)
+            self._inspector_scroll.setVisible(False)
+        else:
+            left, right = self._focus_restore or (True, True)
+            self._main_toolbar.setVisible(True)
+            self._canvas_header.setVisible(True)
+            self._status_panel.setVisible(True)
+            self._left_panel_action.setChecked(left)
+            self._right_panel_action.setChecked(right)
+            self._nav_panel.setVisible(left)
+            self._inspector_scroll.setVisible(right)
+            self._focus_restore = None
+
     def _activate_layer(self, layer: str):
         if layer == "global":
             # Global adjustments are their own section now, not a layer tab.
@@ -4565,6 +4757,7 @@ class PortraitEnhancerQtWindow(QMainWindow):
     def _load_image_path(self, path: str, project_state=None):
         self.file_path = path
         self.statusBar().showMessage(f"Loading {os.path.basename(path)} ...")
+        self.image_label.reset_view()
         full = self._read_image_file(path)
         preview, scale = self._build_preview_proxy(full)
         interactive_preview, interactive_ratio = self._build_interactive_preview_proxy(preview)

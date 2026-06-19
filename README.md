@@ -112,6 +112,8 @@ uv run --extra dev pytest
     - saved batch profiles inside the batch dialog for reusing preset/folder/output setups
     - preview rendering through the shared processing pipeline
     - Lightroom-style workspace: left navigation/presets, center canvas, right editing inspector grouped by task (Portrait / Masks / Basic / Color)
+    - collapsible chrome to enlarge the canvas: toggle the left panel (`Ctrl+Shift+L`), right inspector (`Ctrl+Shift+R`), or a Focus mode that hides all panels/bars (`Ctrl+Shift+F`)
+    - canvas zoom/pan: trackpad pinch (or `Ctrl`/`Cmd`+scroll) zooms toward the cursor, two-finger scroll / left-drag pans when zoomed in, double-click resets to fit — mask paint, crop, and white-balance picking stay pixel-accurate at any zoom
     - export dialog: JPEG/PNG/TIFF, JPEG quality, optional long-edge resize, keep-metadata (EXIF/ICC/DPI) toggle, destination + filename preview
 3. The Tk app still has the deeper feature set today for some advanced mask-edit workflows.
 
