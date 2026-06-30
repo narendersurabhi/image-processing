@@ -11,7 +11,20 @@ dist/
 models/*.onnx
 models/*.tflite
 models/*.task
+models/*.pth
 !models/README.md
+
+# Optional model backends fetched by scripts/download_*.py (see models/README.md) -- large
+# binary weights / cloned repos, not source. MaskDINO/RMBG-2.0 are pulled in whole; their own
+# .gitignore inside each clone doesn't apply once nested under this repo.
+models/MaskDINO/
+models/RMBG-2.0/
 
 presets/.preset_browser_state.json
 presets/*.thumb.jpg
+
+# Local photo collections (real user data, not source) -- collections.json + thumbnail cache.
+collections/
+
+# Stray empty artifact, not real source.
+portrait_enhancer/core/test.txt
