@@ -67,6 +67,41 @@ uv run --extra qt python portrait_enhancer_qt.py
 uv run --extra dev pytest
 ```
 
+The app runs fully on the setup above with **zero models downloaded** -- every face/mask/denoise
+feature has a classical-CV or heuristic fallback (Haar cascade face detection, watershed person
+splitting, etc.), so it's immediately usable out of the box.
+
+## Optional: Better Masks, Denoise, and Crop Models
+
+Installing the optional ML backends meaningfully improves mask quality (especially multi-person
+photos), denoise quality, and face detail. None are required -- the app degrades gracefully when
+a model is missing, and the in-app **System Check** panel (toolbar -> System Check) shows exactly
+which backends are active and why any are falling back.
+
+Quick path to the best quality:
+
+```bash
+uv sync --extra qt --extra model        # mediapipe + onnxruntime: face landmarks/parsing, SAM, etc.
+python scripts/download_sam_model.py    # SAM ViT-B: learned per-person instance masks
+python scripts/download_maskdino_model.py   # Mask DINO: best Person-layer quality (needs torch + detectron2, see below)
+pip install ".[rmbg]"
+python scripts/download_rmbg_model.py --i-understand-license   # RMBG-2.0: best Subject/Background separation
+```
+
+Notes:
+
+- **RMBG-2.0** weights are gated on Hugging Face (non-commercial license unless separately
+  licensed by BRIA) -- the `--i-understand-license` flag is a deliberate acknowledgment gate, and
+  you'll need a Hugging Face account with the model's terms accepted (`huggingface-cli login`).
+- **Mask DINO** needs `torch` and `detectron2` installed separately in the active environment --
+  these aren't pip-installable as a plain extra (`detectron2` needs a build toolchain) and are
+  intentionally left out of `pyproject.toml`'s extras.
+- Each `scripts/download_*.py` validates what it fetches (loads the model and runs a test
+  inference) before declaring success; re-run with `--skip-download` to just re-validate files
+  you already have.
+- Full per-model details -- exact filenames, env var overrides, backend preference order when
+  multiple are installed -- are in `models/README.md`.
+
 ## Dependency Sets
 1. `pyproject.toml`: canonical dependency metadata for `uv sync` and package installs.
 2. Default dependencies: base runtime dependencies.
