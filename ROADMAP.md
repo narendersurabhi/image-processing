@@ -73,10 +73,35 @@ The standard local-adjustment primitives are missing.
 
 ## P2 — Detail & color refinement
 
-- ☐ Real denoise with luma/chroma separation (current "Noise Reduc." is a plain
-      Gaussian blur in `core/processing.py`)
+- ☑ Real denoise with luma/chroma separation — this line was stale: `core/processing.py`
+      already does edge-aware luma/chroma-separated bilateral filtering, preferring an
+      optional learned DnCNN denoiser when its model is installed (`core/denoise.py`).
+      2026-06-23: added a dedicated **Color NR** slider (`color_noise_red`) so chroma can be
+      boosted independently of the main Luminance NR slider, instead of one shared amount.
+- ☑ Output / print sharpening applied on export — 2026-06-23: `apply_output_sharpening`
+      (`core/processing.py`) applies a final pass calibrated to the export's actual pixel
+      size (after resize), with an Off/Low/Standard/High selector in both the single-image
+      Export dialog and Collection Export dialog (Quick Export and Export All reuse the
+      last-chosen level). Wired into the collection batch runner (`batch_runner.py`) too.
+- ☑ Sharpening Amount/Radius/Masking — 2026-06-23: added `sharpen_radius`/`sharpen_masking`
+      sliders alongside the existing Sharpness (Amount) slider, wired into
+      `_apply_unsharp_mask`'s previously-hardcoded `radius`/`edge_threshold`. Defaults match
+      the old hardcoded values exactly, so existing presets/projects render unchanged.
+- ☑ Per-region noise reduction — 2026-06-23: added a `noise_red` slider to Skin, Background,
+      and Person (previously global-only), wired through the same `_apply_luma_chroma_denoise`
+      and run before each layer's other detail work. See
+      [docs/NOISE_SHARPENING_STRATEGY.md](docs/NOISE_SHARPENING_STRATEGY.md) for the
+      region-by-region strategy. Eyes/Hair/Lips/Face/Subjects intentionally still rely on
+      global NR + masked Sharpen/Clarity (those are sharpen-only regions anyway).
+      Same day: extended the existing on-open auto-suggestion (`suggest_global_auto_values`,
+      previously Luminance NR/Sharpness only) to also seed **Color NR** (boosted only when
+      measured chroma noise exceeds luminance noise) and to seed Skin/Background/Person's
+      Noise Reduc. from *that region's own mask* (`suggest_region_noise_red`,
+      `estimate_noise_sigma`'s new optional mask param) rather than the whole-image number.
+      The existing per-slider "Auto" buttons were also fixed to be region-aware for these
+      three layers (previously every Auto button used the whole-image estimate regardless of
+      layer). Still purely pixel-measured, no EXIF/ISO/camera metadata involved.
 - ☐ Texture slider (distinct from clarity)
-- ☐ Output / print sharpening applied on export
 - ☐ Split toning / color-grading wheels (shadows · midtones · highlights)
 - ☐ Stronger LUT/profile management: validation previews, intensity mix, more
       LUT/profile formats *(from README "Next Recommended Upgrades")*
@@ -94,6 +119,59 @@ The standard local-adjustment primitives are missing.
 - ☐ Copy-paste settings between images
 - ☐ CSV/HTML batch reports and richer retry filters beyond "latest failed batch"
       *(from README "Next Recommended Upgrades")*
+
+### Collections storage & saved previews ◐
+Collections should be treated as a manifest plus derived artifact folders. The
+source of truth is always the original image reference, saved edit/settings
+payload, source-file signature, render/color settings, and analysis/mask
+signature. Thumbnails, analysis records, and rendered previews are derived
+artifacts that can be regenerated when their key changes.
+
+Current state:
+- ☑ `collections/collections.json` stores collection membership, active
+      collection, per-image overrides, culling/quality metadata, and now
+      `rendered_previews` records.
+- ☑ Derived artifacts live outside the JSON manifest:
+      `collections/thumbnails/`, `collections/analysis_cache/`, and
+      `collections/rendered_previews/`.
+- ☑ Rendered previews are saved per collection image and reused across sessions
+      when the render key still matches. The key includes source path/mtime/size,
+      preview dimensions, render-cache version, edit params, layer order/options,
+      color/runtime settings, mask adjustments, and segmentation/model analysis
+      signature.
+- ☑ Filmstrip selection shows decoded source pixels first, then restores the
+      saved rendered preview or renders once when the key changed.
+
+Next implementation steps:
+- ☐ Add explicit collection schema/version fields and migration helpers for
+      `collections.json` so new collection metadata can evolve without ad hoc
+      compatibility code.
+- ☐ Move from one global `collections.json` to per-collection folders:
+      `collections/<collection_id>/manifest.json`, `thumbnails/`,
+      `rendered_previews/`, `analysis_cache/`, and optional `exports/`.
+- ☐ Use stable collection/image IDs internally instead of source paths as primary
+      keys; keep source paths as mutable metadata so moved files can be repaired
+      without losing edits/previews.
+- ☐ Add a collection integrity pass: detect missing source files, stale preview
+      artifacts, orphaned cache files, and records pointing at missing artifacts;
+      offer repair/prune actions in the UI.
+- ☐ Add background rendered-preview generation for newly imported images and for
+      images whose saved settings changed, with cancellation when a newer edit key
+      supersedes the queued render.
+- ☐ Add cache-hit/miss telemetry in the status/perf label so it is obvious when a
+      collection image reused a saved preview versus rendered fresh.
+- ☐ Add tests for render-key stability, invalidation on edit/source/model changes,
+      collection JSON round-trip, and orphan-artifact pruning.
+
+Longer-term target:
+- ☐ Migrate the collection manifest to SQLite when collections become large:
+      `images`, `image_settings`, `rendered_previews`, `analysis_refs`,
+      `exports/jobs`, and `schema_migrations` tables.
+- ☐ Use atomic transactions for edit-state changes and preview-record updates so a
+      crash cannot leave the manifest pointing at a half-written artifact.
+- ☐ Support two storage modes: referenced originals (current behavior) and managed
+      imports that copy originals into the collection package for portable
+      archives.
 
 ---
 

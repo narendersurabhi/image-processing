@@ -1,0 +1,1 @@
+{"name": "default", "global_params": {"exposure": 0, "blacks": 0, "whites": 0, "vibrance": 0, "saturation": 0, "warmth": 0, "sharpness": 0, "noise_red": 0}, "selective_params": {}, "color_settings": {"input_profile": "auto", "raw_white_balance": "camera", "raw_colorspace": "srgb", "working_space": "srgb", "output_transform": "srgb"}}

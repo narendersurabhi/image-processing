@@ -24,6 +24,13 @@ model = [
   "mediapipe>=0.10.14",
   "onnxruntime>=1.18.0",
 ]
+rmbg = [
+  "torch",
+  "torchvision",
+  "transformers>=4.40.0",
+  "kornia",
+  "huggingface-hub",
+]
 qt = [
   "PySide6>=6.7.0",
 ]

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .utils import clamp01
+from .utils import clamp01, linear_to_srgb, srgb_to_linear
 
 LUT_SIZE = 256
 DEFAULT_CURVE = [(0.0, 0.0), (1.0, 1.0)]
@@ -90,26 +90,36 @@ def curve_to_lut(points, size: int = LUT_SIZE) -> np.ndarray:
     return np.clip(_pchip(xs, ys, x_eval), 0.0, 1.0).astype(np.float32)
 
 
-def apply_curve(img: np.ndarray, points) -> np.ndarray:
+def apply_curve(img: np.ndarray, points, working_space: str = "srgb") -> np.ndarray:
     """Apply the tone curve to ``img`` (float 0..1), preserving chroma.
 
     Mirrors the band tone-curve handling: map luminance through the curve, scale
     RGB by the resulting gain, and blend a little direct per-channel mapping so the
     curve stays responsive while keeping chroma shifts restrained.
+
+    The curve is display-referred; in a scene-linear working space convert to display
+    sRGB, apply, and convert back. Default working_space="srgb" is byte-identical to before.
     """
     if is_identity(points):
         return img
-    lut = curve_to_lut(points)
+    if working_space == "linear":
+        disp = linear_to_srgb(clamp01(img.astype(np.float32)))
+        return srgb_to_linear(apply_curve(disp, points))
+    # Apply by interpolating into a high-res sampling of the spline rather than indexing a
+    # 256-entry LUT via (v*255).astype(uint8): that uint8 step quantized the input to 256
+    # levels and banded smooth 16-bit RAW gradients. np.interp keeps full input precision.
+    lut = curve_to_lut(points, size=4096)
+    lut_x = np.linspace(0.0, 1.0, lut.shape[0]).astype(np.float32)
     img = clamp01(img.astype(np.float32))
     luma = np.clip(
         img[:, :, 0] * _LUMA[0] + img[:, :, 1] * _LUMA[1] + img[:, :, 2] * _LUMA[2],
         0.0,
         1.0,
     ).astype(np.float32)
-    mapped = lut[(luma * 255).astype(np.uint8)]
+    mapped = np.interp(luma, lut_x, lut).astype(np.float32)
     gain = mapped / np.maximum(luma, 1e-4)
     remapped = img * gain[:, :, np.newaxis]
-    direct = lut[(img * 255).astype(np.uint8)]
+    direct = np.interp(img, lut_x, lut).astype(np.float32)
     return clamp01(remapped * 0.85 + direct * 0.15)
 
 

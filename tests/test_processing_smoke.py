@@ -8,15 +8,27 @@ try:
         _apply_eye_whitening,
         _apply_face_refinement,
         _apply_expression_warp,
+        _apply_luma_chroma_denoise,
+        _apply_unsharp_mask,
         _build_skin_protection_mask,
         _layer_composite_mask,
         _make_effect_masks,
+        _offset_expression_guides,
+        _scale_expression_guides,
+        apply_output_sharpening,
+        StagePipelineCache,
+        estimate_chroma_noise_sigma,
+        estimate_noise_sigma,
         expression_warp_mode,
         process_background_layer,
         process_all_layers,
         process_face_layer,
+        process_global,
         process_hair_layer,
+        process_person_layer,
         process_skin_layer,
+        suggest_global_auto_values,
+        suggest_region_noise_red,
         _apply_micro_contrast,
         _even_skin_chroma,
         _hair_strand_mask,
@@ -465,6 +477,551 @@ class ProcessingSmokeTests(unittest.TestCase):
 
         self.assertEqual(result.shape, img.shape)
         self.assertGreater(float(np.abs(result[:, 16:] - img[:, 16:]).mean()), 0.001)
+
+    def test_suggest_auto_crop_centers_on_off_center_subject(self):
+        from portrait_enhancer.core.processing import suggest_auto_crop
+
+        h, w = 200, 300
+        img = np.full((h, w, 3), 0.5, dtype=np.float32)
+        mask = np.zeros((h, w), dtype=np.float32)
+        mask[40:120, 20:80] = 1.0  # small subject in the left third, not frame-centered
+
+        suggestion = suggest_auto_crop(img, mask, target_aspect=None)
+
+        self.assertIn("crop", suggestion)
+        x, y, cw, ch = suggestion["crop"]
+        # The crop should be tighter than the full frame and shifted toward the subject
+        # (left of frame center), not centered on the frame.
+        self.assertLess(cw, 0.9)
+        self.assertLess(x + cw / 2.0, 0.5)
+
+    def test_suggest_auto_crop_fits_target_aspect_within_frame(self):
+        from portrait_enhancer.core.processing import suggest_auto_crop
+
+        h, w = 200, 300  # frame aspect 1.5
+        img = np.full((h, w, 3), 0.5, dtype=np.float32)
+        mask = np.zeros((h, w), dtype=np.float32)
+        mask[50:150, 100:200] = 1.0
+
+        suggestion = suggest_auto_crop(img, mask, target_aspect=1.0)
+
+        x, y, cw, ch = suggestion["crop"]
+        self.assertAlmostEqual(cw * w / (ch * h), 1.0, places=2)
+        self.assertGreaterEqual(x, -1e-6)
+        self.assertLessEqual(x + cw, 1.0 + 1e-6)
+
+    def test_suggest_auto_crop_uses_face_guides_for_headroom(self):
+        from portrait_enhancer.core.processing import suggest_auto_crop
+
+        h, w = 400, 300
+        img = np.full((h, w, 3), 0.5, dtype=np.float32)
+        mask = np.zeros((h, w), dtype=np.float32)
+        mask[70:360, 95:205] = 1.0
+        faces = [(110, 70, 80, 95)]
+        guides = {
+            "left_eye_upper": (130.0, 112.0),
+            "left_eye_lower": (130.0, 118.0),
+            "right_eye_upper": (170.0, 112.0),
+            "right_eye_lower": (170.0, 118.0),
+        }
+
+        suggestion = suggest_auto_crop(img, mask, target_aspect=4.0 / 5.0, faces=faces, guides=guides)
+
+        self.assertIn("crop", suggestion)
+        x, y, cw, ch = suggestion["crop"]
+        self.assertAlmostEqual(cw * w / (ch * h), 4.0 / 5.0, places=2)
+        eye_y = 115.0 / h
+        rel_eye_y = (eye_y - y) / ch
+        self.assertGreater(rel_eye_y, 0.18)
+        self.assertLess(rel_eye_y, 0.48)
+
+    def test_suggest_auto_crop_free_mode_chooses_stable_candidate_aspect(self):
+        from portrait_enhancer.core.processing import suggest_auto_crop
+
+        h, w = 400, 300
+        img = np.full((h, w, 3), 0.5, dtype=np.float32)
+        mask = np.zeros((h, w), dtype=np.float32)
+        mask[80:340, 90:210] = 1.0
+
+        suggestion = suggest_auto_crop(img, mask, target_aspect=None)
+
+        self.assertIn("crop", suggestion)
+        _x, _y, cw, ch = suggestion["crop"]
+        aspect = cw * w / (ch * h)
+        self.assertTrue(any(abs(aspect - target) < 0.04 for target in (3.0 / 4.0, 4.0 / 5.0, 1.0, 2.0 / 3.0)))
+
+    def test_suggest_auto_crop_runs_optional_aesthetic_scorer_on_safe_candidates(self):
+        from portrait_enhancer.core.processing import suggest_auto_crop
+
+        class FakeAestheticScorer:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, crop):
+                self.calls += 1
+                return 0.75
+
+        h, w = 240, 320
+        img = np.full((h, w, 3), 0.5, dtype=np.float32)
+        mask = np.zeros((h, w), dtype=np.float32)
+        mask[70:180, 110:190] = 1.0
+        scorer = FakeAestheticScorer()
+
+        suggestion = suggest_auto_crop(img, mask, target_aspect=None, aesthetic_scorer=scorer)
+
+        self.assertIn("crop", suggestion)
+        self.assertGreater(scorer.calls, 0)
+
+    def test_aesthetic_output_to_score_handles_scalar_and_distribution_outputs(self):
+        from portrait_enhancer.core.aesthetic_crop import aesthetic_output_to_score
+
+        self.assertAlmostEqual(aesthetic_output_to_score(np.array([[7.0]], dtype=np.float32)), 6.0 / 9.0, places=3)
+
+        distribution = np.zeros((1, 10), dtype=np.float32)
+        distribution[0, 8] = 1.0
+        self.assertAlmostEqual(aesthetic_output_to_score(distribution), 8.0 / 9.0, places=3)
+
+    def test_suggest_auto_crop_skips_crop_when_subject_fills_frame(self):
+        from portrait_enhancer.core.processing import suggest_auto_crop
+
+        h, w = 100, 100
+        img = np.full((h, w, 3), 0.5, dtype=np.float32)
+        mask = np.ones((h, w), dtype=np.float32)  # subject already fills the frame
+
+        suggestion = suggest_auto_crop(img, mask, target_aspect=None)
+
+        self.assertNotIn("crop", suggestion)
+
+    def test_suggest_auto_crop_returns_empty_dict_without_subject_mask(self):
+        from portrait_enhancer.core.processing import suggest_auto_crop
+
+        img = np.full((50, 50, 3), 0.5, dtype=np.float32)
+        self.assertEqual(suggest_auto_crop(img, None), {})
+
+    def test_suggest_horizon_angle_detects_known_tilt_and_matches_framing_sign(self):
+        from portrait_enhancer.core.processing import _suggest_horizon_angle
+        from portrait_enhancer.core.framing import apply_framing, default_framing
+        from PIL import Image
+
+        def make_horizon_image(tilt_deg, w=400, h=300):
+            base = np.ones((h, w, 3), dtype=np.float32) * 0.3
+            for y in range(0, h, 30):
+                base[y:y + 3, :, :] = 0.9
+            pil = Image.fromarray((base * 255).astype(np.uint8))
+            # Rotate clockwise by tilt_deg (PIL.rotate is CCW for positive angles).
+            rotated = pil.rotate(-tilt_deg, resample=Image.BICUBIC, expand=False, fillcolor=(76, 76, 76))
+            return np.asarray(rotated, dtype=np.float32) / 255.0
+
+        img = make_horizon_image(6.0)
+        angle = _suggest_horizon_angle(img, None)
+        self.assertIsNotNone(angle)
+        self.assertAlmostEqual(angle, 6.0, delta=0.5)
+
+        # Applying the suggested angle through the real framing pipeline should straighten
+        # the image -- a horizon search on the corrected image should find nothing left.
+        framing = default_framing()
+        framing["angle"] = angle
+        corrected = apply_framing(Image.fromarray((img * 255).astype(np.uint8)), framing)
+        residual = _suggest_horizon_angle(np.asarray(corrected, dtype=np.float32) / 255.0, None)
+        self.assertIsNone(residual)
+
+    def test_suggest_horizon_angle_stays_silent_without_a_clear_horizon(self):
+        from portrait_enhancer.core.processing import _suggest_horizon_angle
+
+        rng = np.random.default_rng(0)
+        noise_img = rng.uniform(0.0, 1.0, (200, 200, 3)).astype(np.float32)
+        self.assertIsNone(_suggest_horizon_angle(noise_img, None))
+
+    def _noisy_image(self, seed=0, size=64):
+        rng = np.random.default_rng(seed)
+        base = np.full((size, size, 3), 0.5, dtype=np.float32)
+        noise = rng.normal(0.0, 0.05, base.shape).astype(np.float32)
+        return np.clip(base + noise, 0.0, 1.0)
+
+    def test_chroma_boost_zero_matches_pre_existing_single_amount_behavior(self):
+        # Backward compatibility: chroma_boost=0 (its default) must denoise chroma by exactly
+        # `amount`, identical to this function's behavior before chroma_boost was added --
+        # forces the bilateral path (fast_preview=True) so this isn't sensitive to whether an
+        # optional ML denoiser model happens to be installed.
+        img = self._noisy_image()
+        baseline = _apply_luma_chroma_denoise(img, 0.6, working_space="srgb", fast_preview=True)
+        explicit_zero = _apply_luma_chroma_denoise(img, 0.6, 0.0, working_space="srgb", fast_preview=True)
+        self.assertTrue(np.array_equal(baseline, explicit_zero))
+
+    def test_chroma_boost_raises_chroma_smoothing_above_luma(self):
+        img = self._noisy_image()
+        low_chroma = _apply_luma_chroma_denoise(img, 0.1, 0.1, working_space="srgb", fast_preview=True)
+        boosted = _apply_luma_chroma_denoise(img, 0.1, 0.9, working_space="srgb", fast_preview=True)
+        # A bigger chroma_boost should change the result more relative to the unfiltered
+        # image -- the two outputs must differ when chroma_boost actually differs.
+        self.assertFalse(np.array_equal(low_chroma, boosted))
+
+    def test_chroma_only_denoise_runs_even_with_zero_luma_amount(self):
+        img = self._noisy_image()
+        result = _apply_luma_chroma_denoise(img, 0.0, 0.8, working_space="srgb", fast_preview=True)
+        self.assertFalse(np.array_equal(result, img))
+
+    def test_denoise_no_op_when_both_amounts_zero(self):
+        img = self._noisy_image()
+        result = _apply_luma_chroma_denoise(img, 0.0, 0.0, working_space="srgb", fast_preview=True)
+        self.assertTrue(np.array_equal(result, img))
+
+    def test_global_layer_reads_color_noise_red_param(self):
+        img = self._noisy_image()
+        only_luma = process_global(img, {"noise_red": 60}, runtime_settings={"fast_interactive_preview": True})
+        with_color = process_global(
+            img, {"noise_red": 60, "color_noise_red": 100}, runtime_settings={"fast_interactive_preview": True}
+        )
+        self.assertFalse(np.array_equal(only_luma, with_color))
+
+    def test_unsharp_mask_radius_and_masking_change_the_result(self):
+        img = self._noisy_image(seed=1)
+        narrow = _apply_unsharp_mask(img, 1.0, working_space="srgb", radius=0.6, edge_threshold=0.04)
+        wide = _apply_unsharp_mask(img, 1.0, working_space="srgb", radius=2.5, edge_threshold=0.04)
+        self.assertFalse(np.array_equal(narrow, wide))
+
+        low_masking = _apply_unsharp_mask(img, 1.0, working_space="srgb", radius=1.4, edge_threshold=0.0)
+        high_masking = _apply_unsharp_mask(img, 1.0, working_space="srgb", radius=1.4, edge_threshold=0.4)
+        self.assertFalse(np.array_equal(low_masking, high_masking))
+
+    def test_global_layer_reads_sharpen_radius_and_masking_params(self):
+        img = self._noisy_image(seed=1)
+        default_sharp = process_global(img, {"sharpness": 50})
+        wide_radius = process_global(img, {"sharpness": 50, "sharpen_radius": 300})
+        self.assertFalse(np.array_equal(default_sharp, wide_radius))
+
+    def test_process_all_layers_can_capture_sharpen_mask_preview_with_zero_sharpness(self):
+        img = self._noisy_image(seed=1)
+        debug_sink = {}
+        result = process_all_layers(
+            img,
+            {"global": {"sharpness": 0, "sharpen_masking": 8}},
+            masks=None,
+            debug_sink=debug_sink,
+        )
+
+        self.assertIsInstance(result, PILImage)
+        mask = debug_sink.get("sharpen_mask")
+        self.assertIsNotNone(mask)
+        self.assertEqual(mask.shape, img.shape[:2])
+        self.assertGreaterEqual(float(mask.min()), 0.0)
+        self.assertLessEqual(float(mask.max()), 1.0)
+        self.assertGreater(float(mask.max()), float(mask.min()))
+
+    def test_output_sharpening_off_is_identity(self):
+        from PIL import Image
+
+        pil = Image.fromarray((self._noisy_image(size=32) * 255).astype(np.uint8))
+        self.assertIs(apply_output_sharpening(pil, "off"), pil)
+        self.assertIs(apply_output_sharpening(pil, "not-a-real-level"), pil)
+
+    def test_output_sharpening_levels_increase_in_strength(self):
+        from PIL import Image
+
+        arr = (self._noisy_image(size=200) * 255).astype(np.uint8)
+        pil = Image.fromarray(arr)
+        low = np.asarray(apply_output_sharpening(pil, "low"), dtype=np.int32)
+        standard = np.asarray(apply_output_sharpening(pil, "standard"), dtype=np.int32)
+        high = np.asarray(apply_output_sharpening(pil, "high"), dtype=np.int32)
+        base = arr.astype(np.int32)
+        diff_low = np.abs(low - base).mean()
+        diff_standard = np.abs(standard - base).mean()
+        diff_high = np.abs(high - base).mean()
+        self.assertLess(diff_low, diff_standard)
+        self.assertLess(diff_standard, diff_high)
+
+    def test_output_sharpening_preserves_image_size(self):
+        from PIL import Image
+
+        pil = Image.fromarray((self._noisy_image(size=150) * 255).astype(np.uint8))
+        sharpened = apply_output_sharpening(pil, "standard")
+        self.assertEqual(sharpened.size, pil.size)
+
+    def test_output_sharpening_protects_flat_regions_more_than_edges(self):
+        from PIL import Image
+
+        arr = np.full((160, 160, 3), 128, dtype=np.uint8)
+        arr[:, 80:] = 190
+        rng = np.random.default_rng(7)
+        arr[:, :70] = np.clip(arr[:, :70].astype(np.int16) + rng.integers(-3, 4, arr[:, :70].shape), 0, 255).astype(np.uint8)
+        pil = Image.fromarray(arr)
+
+        sharpened = np.asarray(apply_output_sharpening(pil, "high"), dtype=np.int16)
+        base = arr.astype(np.int16)
+        flat_delta = float(np.abs(sharpened[:, 10:60] - base[:, 10:60]).mean())
+        edge_delta = float(np.abs(sharpened[:, 76:84] - base[:, 76:84]).mean())
+
+        self.assertGreater(edge_delta, flat_delta * 2.0)
+
+    def _half_masked(self, size=48):
+        # mask=1 on the left half, 0 on the right half -- lets a test prove an edit is
+        # confined to the masked region instead of leaking across the whole frame.
+        img = self._noisy_image(size=size)
+        mask = np.zeros((size, size), dtype=np.float32)
+        mask[:, : size // 2] = 1.0
+        return img, mask
+
+    def test_skin_layer_noise_red_denoises_only_inside_its_mask(self):
+        img, mask = self._half_masked()
+        result = process_skin_layer(img, img, mask, {"noise_red": 80})
+        # Mask edges are intentionally feathered (smooth_mask), so check well clear of the
+        # boundary rather than the exact half-line.
+        self.assertFalse(np.array_equal(result[:, :10], img[:, :10]))
+        self.assertTrue(np.array_equal(result[:, -10:], img[:, -10:]))
+
+    def test_skin_layer_without_noise_red_key_is_unaffected(self):
+        # Absence of "noise_red" (e.g. an older saved preset) must default to 0 and skip the
+        # new code path entirely, not raise.
+        img, mask = self._half_masked()
+        result = process_skin_layer(img, img, mask, {"smooth": 30})
+        self.assertEqual(result.shape, img.shape)
+
+    def test_background_layer_noise_red_denoises_only_inside_its_mask(self):
+        img, mask = self._half_masked()
+        result = process_background_layer(img, img, mask, {"noise_red": 80})
+        self.assertFalse(np.array_equal(result[:, :10], img[:, :10]))
+        self.assertTrue(np.array_equal(result[:, -10:], img[:, -10:]))
+
+    def test_person_layer_noise_red_denoises_only_inside_its_mask(self):
+        img, mask = self._half_masked()
+        result = process_person_layer(img, img, mask, {"noise_red": 80})
+        self.assertFalse(np.array_equal(result[:, :10], img[:, :10]))
+        self.assertTrue(np.array_equal(result[:, -10:], img[:, -10:]))
+
+    def _chroma_noisy_image(self, size=100, std=15.0, seed=0):
+        import cv2
+
+        rng = np.random.default_rng(seed)
+        base_u8 = np.full((size, size, 3), 128, dtype=np.uint8)
+        lab = cv2.cvtColor(base_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+        lab[:, :, 1] += rng.normal(0, std, lab.shape[:2]).astype(np.float32)
+        lab[:, :, 2] += rng.normal(0, std, lab.shape[:2]).astype(np.float32)
+        rgb = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+        return rgb.astype(np.float32) / 255.0
+
+    def test_estimate_noise_sigma_with_mask_isolates_a_noisy_region(self):
+        clean = np.full((100, 100, 3), 0.5, dtype=np.float32)
+        noisy = self._noisy_image(size=100)
+        mixed = clean.copy()
+        mixed[:, :50] = noisy[:, :50]
+        mask_left = np.zeros((100, 100), dtype=np.float32)
+        mask_left[:, :50] = 1.0
+        mask_right = np.zeros((100, 100), dtype=np.float32)
+        mask_right[:, 50:] = 1.0
+
+        self.assertGreater(estimate_noise_sigma(mixed, mask_left), estimate_noise_sigma(mixed, mask_right))
+
+    def test_estimate_noise_sigma_returns_zero_for_too_small_a_region(self):
+        img = self._noisy_image(size=100)
+        tiny_mask = np.zeros((100, 100), dtype=np.float32)
+        tiny_mask[0, 0] = 1.0  # well under the 25-effective-pixel floor
+        self.assertEqual(estimate_noise_sigma(img, tiny_mask), 0.0)
+
+    def test_estimate_noise_sigma_returns_zero_for_mismatched_mask_shape(self):
+        img = self._noisy_image(size=100)
+        wrong_shape_mask = np.ones((50, 50), dtype=np.float32)
+        self.assertEqual(estimate_noise_sigma(img, wrong_shape_mask), 0.0)
+
+    def test_estimate_chroma_noise_sigma_detects_color_only_noise(self):
+        clean = np.full((100, 100, 3), 0.5, dtype=np.float32)
+        chroma_noisy = self._chroma_noisy_image()
+        self.assertGreater(estimate_chroma_noise_sigma(chroma_noisy), estimate_chroma_noise_sigma(clean))
+
+    def test_suggest_global_auto_values_includes_color_noise_red(self):
+        clean = np.full((100, 100, 3), 0.5, dtype=np.float32)
+        suggestion = suggest_global_auto_values(clean)
+        self.assertIn("color_noise_red", suggestion)
+        self.assertEqual(suggestion["color_noise_red"], 0)
+
+    def test_suggest_global_auto_values_boosts_color_noise_red_for_chroma_heavy_noise(self):
+        chroma_noisy = self._chroma_noisy_image()
+        suggestion = suggest_global_auto_values(chroma_noisy)
+        # The whole point of a separate Color NR suggestion: a chroma-noise-dominant image
+        # should get a meaningfully higher color_noise_red than noise_red, not just a uniform
+        # bump to both (that's what noise_red alone already does).
+        self.assertGreater(suggestion["color_noise_red"], suggestion["noise_red"])
+
+    def test_suggest_region_noise_red_returns_zero_without_a_mask(self):
+        img = self._noisy_image(size=100)
+        self.assertEqual(suggest_region_noise_red(img, None), 0)
+
+    def test_suggest_region_noise_red_responds_to_a_real_masked_region(self):
+        img = self._noisy_image(size=100, seed=2)
+        mask = np.ones((100, 100), dtype=np.float32)
+        clean = np.full((100, 100, 3), 0.5, dtype=np.float32)
+        self.assertGreater(suggest_region_noise_red(img, mask), suggest_region_noise_red(clean, mask))
+
+
+@unittest.skipUnless(HAS_DEPS, "numpy/Pillow not installed")
+class CropSafeVignetteTests(unittest.TestCase):
+    """Vignette is the only position-dependent effect in process_global -- crop_origin/
+    full_shape let it be computed against the full image's center when processing a
+    sub-crop (hi-res tile rendering), instead of the crop's own (wrong) center."""
+
+    def _scene(self, h=200, w=300):
+        img = np.full((h, w, 3), 0.5, dtype=np.float32)
+        return img
+
+    def test_default_args_are_byte_identical_to_current_behavior(self):
+        img = self._scene()
+        params = {"vignette": 60}
+        baseline = process_global(img, params)
+        explicit = process_global(img, params, crop_origin=(0, 0), full_shape=img.shape[:2])
+        np.testing.assert_array_equal(baseline, explicit)
+
+    def test_crop_matches_corresponding_region_of_full_image(self):
+        h, w = 200, 300
+        img = self._scene(h, w)
+        params = {"vignette": 60}
+        full_out = process_global(img, params)
+
+        oy, ox, ch, cw = 50, 80, 90, 120
+        crop = img[oy : oy + ch, ox : ox + cw].copy()
+        crop_out = process_global(crop, params, crop_origin=(ox, oy), full_shape=(h, w))
+
+        np.testing.assert_array_equal(crop_out, full_out[oy : oy + ch, ox : ox + cw])
+
+    def test_crop_without_full_shape_uses_its_own_wrong_center(self):
+        # Sanity check that the test above is actually exercising the fix: omitting
+        # full_shape/crop_origin for an off-center crop must NOT match the full-image
+        # region (the crop would vignette around its own center instead).
+        h, w = 200, 300
+        img = self._scene(h, w)
+        params = {"vignette": 60}
+        full_out = process_global(img, params)
+
+        oy, ox, ch, cw = 50, 80, 90, 120
+        crop = img[oy : oy + ch, ox : ox + cw].copy()
+        crop_out_naive = process_global(crop, params)
+
+        self.assertFalse(np.array_equal(crop_out_naive, full_out[oy : oy + ch, ox : ox + cw]))
+
+
+@unittest.skipUnless(HAS_DEPS, "numpy/Pillow not installed")
+class ExpressionGuideOffsetTests(unittest.TestCase):
+    def test_offset_translates_points(self):
+        guides = {"left_eye": (10.0, 20.0), "label": "face"}
+        out = _offset_expression_guides(guides, -5.0, 3.0)
+        self.assertEqual(out["left_eye"], (5.0, 23.0))
+        self.assertEqual(out["label"], "face")
+
+    def test_offset_handles_list_of_guides(self):
+        guides = [{"left_eye": (10.0, 20.0)}, {"left_eye": (30.0, 40.0)}]
+        out = _offset_expression_guides(guides, 1.0, 1.0)
+        self.assertEqual(out[0]["left_eye"], (11.0, 21.0))
+        self.assertEqual(out[1]["left_eye"], (31.0, 41.0))
+
+    def test_offset_none_is_none(self):
+        self.assertIsNone(_offset_expression_guides(None, 1.0, 1.0))
+
+    def test_offset_then_scale_inverse_round_trips(self):
+        # Mirrors the real usage shape (guides scaled from preview->full, then offset into
+        # a crop's local frame) -- offsetting by the negative origin and back is a no-op.
+        guides = {"nose": (123.0, 45.0)}
+        shifted = _offset_expression_guides(guides, -100.0, -20.0)
+        back = _offset_expression_guides(shifted, 100.0, 20.0)
+        self.assertEqual(back["nose"], guides["nose"])
+
+
+@unittest.skipUnless(HAS_DEPS, "numpy/Pillow not installed")
+class StagePipelineCacheTests(unittest.TestCase):
+    """The cached-graph pipeline (#3): a stage cache must (a) never change output vs the
+    un-cached pipeline, and (b) skip recomputing upstream stages when only a downstream
+    slider changes."""
+
+    def _scene(self, size=96):
+        rng = np.random.default_rng(7)
+        img = (rng.random((size, size, 3), dtype=np.float32) * 0.6 + 0.2).astype(np.float32)
+        masks = {
+            "background": np.ones((size, size), dtype=np.float32),
+            "skin": np.zeros((size, size), dtype=np.float32),
+        }
+        masks["skin"][size // 4 : 3 * size // 4, size // 4 : 3 * size // 4] = 1.0
+        return img, masks, ("background", "skin")
+
+    def _params(self, skin_smooth=30, exposure=12):
+        return {
+            "global": {"exposure": exposure, "clarity": 20, "noise_red": 30, "sharpness": 25},
+            "background": {"blur": 20, "noise_red": 25},
+            "skin": {"smooth": skin_smooth, "blemish": 20, "noise_red": 15},
+        }
+
+    def test_cached_output_is_identical_to_uncached(self):
+        img, masks, order = self._scene()
+        params = self._params()
+        ref = np.asarray(process_all_layers(img, params, masks, layer_order=order))
+        cache = StagePipelineCache()
+        got = np.asarray(
+            process_all_layers(img, params, masks, layer_order=order, stage_cache=cache, inputs_token="t1")
+        )
+        self.assertTrue(np.array_equal(ref, got))
+
+    def test_repeated_identical_render_is_all_hits_and_stable(self):
+        img, masks, order = self._scene()
+        params = self._params()
+        cache = StagePipelineCache()
+        first = np.asarray(
+            process_all_layers(img, params, masks, layer_order=order, stage_cache=cache, inputs_token="t1")
+        )
+        second = np.asarray(
+            process_all_layers(img, params, masks, layer_order=order, stage_cache=cache, inputs_token="t1")
+        )
+        self.assertTrue(np.array_equal(first, second))
+        # Second render reused every stage rather than recomputing any.
+        self.assertGreater(cache.hits, 0)
+
+    def test_downstream_slider_change_reuses_upstream_stages(self):
+        import portrait_enhancer.core.processing as P
+
+        img, masks, order = self._scene()
+        cache = StagePipelineCache()
+        calls = {"global": 0, "face": 0}
+        orig_global, orig_face = P.process_global, P._apply_face_refinement
+
+        def spy_global(*a, **k):
+            calls["global"] += 1
+            return orig_global(*a, **k)
+
+        def spy_face(*a, **k):
+            calls["face"] += 1
+            return orig_face(*a, **k)
+
+        with patch.object(P, "process_global", spy_global), patch.object(P, "_apply_face_refinement", spy_face):
+            process_all_layers(img, self._params(skin_smooth=30), masks, layer_order=order, stage_cache=cache, inputs_token="t1")
+            self.assertEqual((calls["global"], calls["face"]), (1, 1))
+            # Drag a SKIN slider -> upstream global/face must be cache hits, not recomputed.
+            process_all_layers(img, self._params(skin_smooth=45), masks, layer_order=order, stage_cache=cache, inputs_token="t1")
+            self.assertEqual((calls["global"], calls["face"]), (1, 1))
+            # Change a GLOBAL slider -> upstream must recompute.
+            process_all_layers(img, self._params(skin_smooth=45, exposure=25), masks, layer_order=order, stage_cache=cache, inputs_token="t1")
+            self.assertEqual((calls["global"], calls["face"]), (2, 2))
+
+    def test_inputs_token_bump_invalidates_every_stage(self):
+        import portrait_enhancer.core.processing as P
+
+        img, masks, order = self._scene()
+        cache = StagePipelineCache()
+        params = self._params()
+        calls = {"global": 0}
+        orig_global = P.process_global
+
+        def spy_global(*a, **k):
+            calls["global"] += 1
+            return orig_global(*a, **k)
+
+        with patch.object(P, "process_global", spy_global):
+            process_all_layers(img, params, masks, layer_order=order, stage_cache=cache, inputs_token="t1")
+            # A mask edit / new analysis bumps the token -> stale stages must not be served.
+            process_all_layers(img, params, masks, layer_order=order, stage_cache=cache, inputs_token="t2")
+            self.assertEqual(calls["global"], 2)
+
+    def test_cache_respects_lru_limit(self):
+        cache = StagePipelineCache(limit=3)
+        for i in range(6):
+            cache.put(f"k{i}", np.zeros((2, 2), dtype=np.float32))
+        # Oldest keys evicted, newest retained.
+        self.assertIsNone(cache.get("k0"))
+        self.assertIsNotNone(cache.get("k5"))
 
 
 if __name__ == "__main__":

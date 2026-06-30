@@ -1612,10 +1612,11 @@ class PortraitEnhancerV2(tk.Tk):
         backend = self.segmenter.backend_label
         detector = getattr(self.segmenter, "detector_backend_label", "detect=haar")
         subjects = getattr(self.segmenter, "subject_backend_label", "subjects=heuristic")
+        parts = getattr(self.segmenter, "face_part_backend_label", "parts=semantic")
         facial_hair = getattr(self.segmenter, "facial_hair_backend_label", "f_hair=fallback")
         face_note = f", face {self._active_face_index + 1}" if len(self._detected_faces) > 1 else ""
         self.status_var.set(
-            f"Analyzing faces ({backend}; {detector}; {subjects}; {facial_hair}{face_note}) ... preview {preview_w}x{preview_h} (source {full_w}x{full_h})"
+            f"Analyzing faces ({backend}; {detector}; {subjects}; {parts}; {facial_hair}{face_note}) ... preview {preview_w}x{preview_h} (source {full_w}x{full_h})"
         )
         self.update()
         threading.Thread(target=self._segmentation_thread, args=(revision,), daemon=True).start()
@@ -1674,12 +1675,13 @@ class PortraitEnhancerV2(tk.Tk):
         backend = self.segmenter.backend_label
         detector = getattr(self.segmenter, "detector_backend_label", "detect=haar")
         subjects = getattr(self.segmenter, "subject_backend_label", "subjects=heuristic")
+        parts = getattr(self.segmenter, "face_part_backend_label", "parts=semantic")
         facial_hair = getattr(self.segmenter, "facial_hair_backend_label", "f_hair=fallback")
         reason = getattr(self.segmenter, "reason_unavailable", "")
         reason_note = f" · {reason}" if reason else ""
         face_note = f"faces={len(self._detected_faces)}, target={self._active_face_index + 1}" if self._detected_faces else "faces=0"
         self.status_var.set(
-            f"{name}  {full_w}x{full_h}  -  {status}  [{backend}; {detector}; {subjects}; {facial_hair}{reason_note}; {face_note}]  (preview {preview_w}x{preview_h})"
+            f"{name}  {full_w}x{full_h}  -  {status}  [{backend}; {detector}; {subjects}; {parts}; {facial_hair}{reason_note}; {face_note}]  (preview {preview_w}x{preview_h})"
         )
         self._refresh_mask_tool_state()
         self._enqueue_render()

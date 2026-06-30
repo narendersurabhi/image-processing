@@ -17,6 +17,8 @@ passes the actual working space — both resolve to the same true-linear space.
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
 
 import numpy as np
 
@@ -213,3 +215,185 @@ def white_patch_gains(image: np.ndarray, working_space: str = "srgb", percentile
     ref = np.maximum(ref, _EPS)
     target = float(ref.max())
     return normalize_gains([target / ref[0], target / ref[1], target / ref[2]])
+
+
+class WhiteBalanceEstimator:
+    """Optional learned auto white balance: an ONNX model that predicts the scene illuminant,
+    converted into neutralizing per-channel gains via the same math as the classical
+    estimators. Unlike Gray World it isn't fooled by a dominant color (a red wall, a green
+    lawn), because it reasons about scene content. Falls back silently (available=False) when
+    the model file or onnxruntime is missing, so Gray World / White Patch keep working.
+
+    Model I/O contract (FC4 / illuminant-estimation family): one image input, NCHW or NHWC,
+    RGB in [0, 1]; one output that reduces to a 3-vector illuminant (RGB). The illuminant is
+    treated as linear RGB; set PORTRAIT_WB_LINEARIZE_INPUT=1 to feed the model a linearized
+    image if your model was trained on linear input.
+    """
+
+    def __init__(self, ref_size: int | None = None):
+        self.available = False
+        self.backend = "none"
+        self.reason_unavailable = ""
+        self.execution_provider = "cpu"
+        self._session = None
+        self._input_name = None
+        self._layout = "nchw"
+        self._linearize_input = os.getenv("PORTRAIT_WB_LINEARIZE_INPUT", "") not in ("", "0", "false", "False")
+        try:
+            self.ref_size = int(ref_size if ref_size is not None else os.getenv("PORTRAIT_WB_REF_SIZE", "512"))
+        except (TypeError, ValueError):
+            self.ref_size = 512
+        self.ref_size = max(64, self.ref_size)
+
+        try:
+            import onnxruntime as ort
+        except Exception as exc:
+            self.reason_unavailable = f"onnxruntime unavailable: {exc}"
+            return
+
+        model_path = self._resolve_model_path()
+        if model_path is None:
+            self.reason_unavailable = "white balance model not found"
+            return
+
+        providers = self._preferred_onnx_providers(ort)
+        try:
+            self._session = ort.InferenceSession(str(model_path), providers=providers)
+        except Exception as exc:
+            try:
+                self._session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+                self.reason_unavailable = f"coreml unavailable; using cpu ({exc})"
+            except Exception as cpu_exc:
+                self.reason_unavailable = f"white balance init failed: {cpu_exc}"
+                return
+        inp = self._session.get_inputs()[0]
+        self._input_name = inp.name
+        self._layout = self._infer_layout(inp.shape)
+        if "CoreMLExecutionProvider" in set(self._session.get_providers()):
+            self.execution_provider = "coreml"
+        self.available = True
+        self.backend = "onnx"
+
+    def _infer(self, image: np.ndarray, working_space: str):
+        """Run the model on a downscaled copy. Returns (small_srgb_HWC, raw_output) or None.
+        small_srgb is always in the image's display space so image-to-image models can be
+        compared input-vs-output regardless of what we feed the net."""
+        if not self.available or self._session is None:
+            return None
+        arr = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            return None
+        small_srgb = _resize_rgb(arr, self.ref_size)
+        model_small = _to_linear(small_srgb, working_space) if self._linearize_input else small_srgb
+        if self._layout == "nhwc":
+            tensor = model_small[None, ...].astype(np.float32)
+        else:
+            tensor = np.transpose(model_small, (2, 0, 1))[None, ...].astype(np.float32)
+        try:
+            out = self._session.run(None, {self._input_name: tensor})[0]
+        except Exception:
+            return None
+        return small_srgb, out
+
+    def estimate_illuminant(self, image: np.ndarray, working_space: str = "srgb"):
+        """Return the predicted scene illuminant as a 3-vector (illuminant-estimation models),
+        or None. Image-to-image AWB models don't expose an illuminant -- use estimate_gains."""
+        res = self._infer(image, working_space)
+        if res is None:
+            return None
+        return self._to_illuminant(res[1])
+
+    def estimate_gains(self, image: np.ndarray, working_space: str = "srgb"):
+        """Neutralizing per-channel gains, supporting both model families:
+
+        - illuminant estimation (output reduces to a 3-vector): gains neutralize the illuminant.
+        - image-to-image AWB (e.g. Deep-WB; output is a corrected image): the diagonal gains
+          that reproduce the model's average input->output color shift, computed in linear light.
+        """
+        res = self._infer(image, working_space)
+        if res is None:
+            return None
+        small_srgb, out = res
+        img_out = self._output_as_image(out, small_srgb.shape[:2])
+        if img_out is not None:
+            in_lin = srgb_to_linear(small_srgb).reshape(-1, 3).mean(axis=0)
+            out_lin = srgb_to_linear(np.clip(img_out, 0.0, 1.0)).reshape(-1, 3).mean(axis=0)
+            gains = [float(out_lin[i]) / max(float(in_lin[i]), _EPS) for i in range(3)]
+            return normalize_gains(gains)
+        illum = self._to_illuminant(out)
+        if illum is None:
+            return None
+        return _gains_from_linear_rgb(illum[0], illum[1], illum[2])
+
+    @staticmethod
+    def _output_as_image(out, hw):
+        """If the model output is a 3-channel image matching the input's spatial size, return
+        it as HxWx3 (image-to-image AWB); otherwise None (illuminant-vector model)."""
+        a = np.squeeze(np.asarray(out, dtype=np.float32))
+        hw = (int(hw[0]), int(hw[1]))
+        if a.ndim == 3:
+            if a.shape[0] == 3 and a.shape[1:] == hw:
+                return np.transpose(a, (1, 2, 0))
+            if a.shape[2] == 3 and a.shape[:2] == hw:
+                return a
+        return None
+
+    @staticmethod
+    def _to_illuminant(out):
+        a = np.squeeze(np.asarray(out, dtype=np.float32))
+        if a.ndim == 1 and a.size == 3:
+            v = a
+        elif a.ndim >= 2 and 3 in a.shape:
+            # Spatial illuminant/confidence map: average everything but the 3-channel axis.
+            ax = next((i for i, n in enumerate(a.shape) if n == 3), None)
+            if ax is None:
+                return None
+            v = a.mean(axis=tuple(i for i in range(a.ndim) if i != ax))
+        elif a.size == 3:
+            v = a.reshape(3)
+        else:
+            return None
+        v = np.abs(np.asarray(v, dtype=np.float32))
+        if v.size != 3 or not np.isfinite(v).all() or float(v.sum()) <= 0:
+            return None
+        return [float(v[0]), float(v[1]), float(v[2])]
+
+    @staticmethod
+    def _infer_layout(shape) -> str:
+        try:
+            if len(shape) == 4:
+                if shape[1] == 3:
+                    return "nchw"
+                if shape[3] == 3:
+                    return "nhwc"
+        except Exception:
+            pass
+        return "nchw"
+
+    def _resolve_model_path(self):
+        candidates = []
+        env_path = os.getenv("PORTRAIT_WB_MODEL")
+        if env_path:
+            candidates.append(Path(env_path))
+        models_dir = Path(__file__).resolve().parents[2] / "models"
+        for name in ("white_balance.onnx", "awb.onnx", "fc4.onnx"):
+            candidates.append(models_dir / name)
+        for path in candidates:
+            if path.exists() and path.is_file():
+                return path
+        return None
+
+    def _preferred_onnx_providers(self, ort):
+        available = set(ort.get_available_providers())
+        providers = []
+        if "CoreMLExecutionProvider" in available:
+            providers.append("CoreMLExecutionProvider")
+        providers.append("CPUExecutionProvider")
+        return providers
+
+
+def _resize_rgb(arr: np.ndarray, ref_size: int) -> np.ndarray:
+    """Square-resize an HxWx3 float image to ref_size, without a hard cv2 import at module load."""
+    import cv2
+
+    return cv2.resize(arr, (int(ref_size), int(ref_size)), interpolation=cv2.INTER_AREA)

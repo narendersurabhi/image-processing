@@ -215,6 +215,22 @@ Optional dedicated facial-hair exclusion:
 2. Or set env var: `PORTRAIT_FACIAL_HAIR_ONNX=/abs/path/to/facial_hair.onnx`
 3. The app status line will show `f_hair=onnx:coreml`, `f_hair=onnx:cpu`, or `f_hair=fallback`
 
+Optional accuracy-first person identity masks:
+1. Run `python scripts/download_maskdino_model.py` to clone the official Mask DINO repo and
+   download the Swin-L COCO instance checkpoint.
+2. Install the platform-specific runtime packages (`torch`, `detectron2`, and Mask DINO
+   dependencies) in the active Python environment.
+3. The app status line will show `person=maskdino` when this backend produces the Person layer.
+4. Set `PORTRAIT_DISABLE_MASKDINO=1` to force the SAM/watershed fallback path.
+
+Optional accuracy-first Subjects / Background masks:
+1. Install runtime deps with `pip install ".[rmbg]"`.
+2. Review the RMBG-2.0 Hugging Face model card/license, then run
+   `python scripts/download_rmbg_model.py --i-understand-license`.
+3. The app status line will show `subjects=rmbg2` when this backend produces the
+   Subjects/Background layers.
+4. Set `PORTRAIT_DISABLE_RMBG=1` to force the MODNet/MediaPipe/heuristic fallback path.
+
 ### macOS / Linux note
 `rawpy` requires LibRaw.
 - macOS: `brew install libraw`
@@ -230,7 +246,13 @@ Face target detection uses:
 1. OpenCV YuNet when a detector ONNX model is available.
 2. Haar cascade fallback when the YuNet model is unavailable.
 
-Backend status is shown in the app status bar during analysis.
+Person target masks use:
+1. Mask DINO person instance segmentation when the repo/checkpoint/runtime are available.
+2. SAM prompted per-person masks when Mask DINO is unavailable.
+3. Face-seeded watershed split when both learned instance paths are unavailable.
+
+Backend status is shown in the app status bar during analysis, including `face=...` and
+`person=...` for the active Person backend.
 
 ## Rendering Model
 1. The source image is kept at full resolution in memory.

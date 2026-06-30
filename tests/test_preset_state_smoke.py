@@ -44,7 +44,10 @@ class PresetStateSmokeTests(unittest.TestCase):
             self.assertEqual(app._sliders["skin"]["smooth"].get(), 40)
             self.assertEqual(app._layer_options["skin"]["opacity"], 65.0)
             self.assertEqual(app._layer_options["skin"]["blend_mode"], "soft_light")
-            self.assertEqual(app._layer_order, ["skin", "hair", "face", "eyes", "lips"])
+            # Older presets may only contain the original selective layers. Loading them should
+            # preserve that relative order while appending newer layers so rendering stays complete.
+            self.assertEqual(app._layer_order[:5], ["skin", "hair", "face", "eyes", "lips"])
+            self.assertEqual(set(app._layer_order), set(app._default_layer_options()))
             self.assertEqual(app._color_settings["input_profile"], "ignore")
             self.assertEqual(app._color_settings["raw_white_balance"], "auto")
             self.assertEqual(app._color_settings["raw_colorspace"], "adobe")
